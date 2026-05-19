@@ -1,0 +1,6 @@
+[submodule "services/api"]
+	path = services/api
+	url = https://github.com
+[submodule "services/frontend"]
+	path = services/frontend
+	url = https://github.com

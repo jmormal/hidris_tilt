@@ -1,0 +1,17 @@
+# k3d-config.yaml
+apiVersion: k3d.io/v1alpha5
+kind: Simple
+metadata:
+  name: hidris
+servers: 1
+ports:
+  - port: 80:80
+    nodeFilters: [server:0]
+  - port: 443:443
+    nodeFilters: [server:0]
+registries:
+  use:
+    - k3d-dev-registry:5000
+options:
+  runtime:
+    gpuRequest: all
