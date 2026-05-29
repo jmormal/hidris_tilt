@@ -10,10 +10,11 @@ def service_js(name, port):
         "./services/" + name,
         entrypoint=["npm", "run", "dev"],
         live_update=[
-            sync("./services/" + name + "/src", "/app/src"),
+            sync("./services/frontend/src", "/app/src"),
+            sync("./services/frontend/public", "/app/public"),
             run(
                 "cd /app && npm install",
-                trigger=["./services/" + name + "/package.json"],
+                trigger=["./services/frontend/package.json"],
             ),
         ],
     )
@@ -46,3 +47,23 @@ def service_python(name, port):
 # ── Services ──────────────────────────────────────────────────────────────────
 service_js("frontend", 3000)
 service_python("api",      8080)
+
+
+# Jupyter
+#
+docker_build(
+    "jupyter",
+    "./services/jupyter",
+    live_update=[
+        run(
+            "cd /app && pip install -r requirements.txt",
+            trigger=["./services/jupyter/requirements.txt"],
+        ),
+    ],
+)
+k8s_yaml("./k8s/jupyter.yaml")
+k8s_resource(
+    workload="jupyter",
+    new_name="jupyter",
+    links=[link("http://jupyter.127.0.0.1.nip.io", "jupyter")],
+)

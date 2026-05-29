@@ -1,4 +1,3 @@
-# k3d-config.yaml
 apiVersion: k3d.io/v1alpha5
 kind: Simple
 metadata:
@@ -12,6 +11,9 @@ ports:
 registries:
   use:
     - k3d-dev-registry:5000
+volumes:
+  - volume: ./services/jupyter/notebooks:/mnt/notebooks
+    nodeFilters: [server:0]
 options:
   runtime:
     gpuRequest: all

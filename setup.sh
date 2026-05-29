@@ -20,6 +20,7 @@ k3d cluster create "${CLUSTER_NAME}" \
   --port "443:443@server:0" \
   --registry-use "k3d-${REGISTRY_NAME}:${REGISTRY_PORT}" \
   --image "${IMAGE_TAG}" \
-  --gpus 1
+  --gpus 1 \
+  --volume "$(pwd)/services/jupyter/notebooks:/mnt/notebooks@server:0"
 
 k3d kubeconfig merge "${CLUSTER_NAME}" --kubeconfig-merge-default

@@ -1,0 +1,58 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jupyter
+spec:
+  selector:
+    matchLabels:
+      app: jupyter
+  template:
+    metadata:
+      labels:
+        app: jupyter
+    spec:
+      containers:
+        - name: jupyter
+          image: jupyter
+          ports:
+            - containerPort: 8888
+          env:
+            - name: API_URL
+              value: "http://api:80"
+          volumeMounts:
+            - name: notebooks
+              mountPath: /app/notebooks
+      volumes:
+        - name: notebooks
+          hostPath:
+            path: /mnt/notebooks
+            type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jupyter
+spec:
+  selector:
+    app: jupyter
+  ports:
+    - port: 80
+      targetPort: 8888
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: jupyter
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: jupyter.127.0.0.1.nip.io
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: jupyter
+                port:
+                  number: 80
