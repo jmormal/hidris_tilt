@@ -1,0 +1,42 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# GPU worker ScaledJob. Spawns one Job per item on jobs:gpu.
+# Image: worker-gpu (CUDA base + torch). Run-once: LPOP one item, process,
+# exit 0 — the pod releases the GPU on exit. minReplicaCount 0 = no idle GPU.
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: keda.sh/v1alpha1
+kind: ScaledJob
+metadata:
+  name: worker-gpu
+spec:
+  scalingStrategy:
+    strategy: default
+  minReplicaCount: 0
+  maxReplicaCount: 4
+  pollingInterval: 15
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  triggers:
+    - type: redis
+      metadata:
+        address: redis:6379
+        listName: jobs:gpu
+        listLength: "1"
+  jobTargetRef:
+    backoffLimit: 3
+    template:
+      spec:
+        restartPolicy: Never
+        containers:
+          - name: worker
+            image: worker-gpu
+            envFrom:
+              - configMapRef:
+                  name: app-config
+              - secretRef:
+                  name: app-secrets
+            env:
+              - name: QUEUE
+                value: "jobs:gpu"
+            resources:
+              limits:
+                nvidia.com/gpu: 1

@@ -1,0 +1,38 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# CPU worker ScaledJob. Spawns one Job per item on jobs:cpu.
+# Image: worker-cpu (slim, no CUDA). Run-once: LPOP one item, process, exit 0.
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: keda.sh/v1alpha1
+kind: ScaledJob
+metadata:
+  name: worker-cpu
+spec:
+  scalingStrategy:
+    strategy: default
+  minReplicaCount: 0
+  maxReplicaCount: 10
+  pollingInterval: 15
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  triggers:
+    - type: redis
+      metadata:
+        address: redis:6379
+        listName: jobs:cpu
+        listLength: "1"
+  jobTargetRef:
+    backoffLimit: 3
+    template:
+      spec:
+        restartPolicy: Never
+        containers:
+          - name: worker
+            image: worker-cpu
+            envFrom:
+              - configMapRef:
+                  name: app-config
+              - secretRef:
+                  name: app-secrets
+            env:
+              - name: QUEUE
+                value: "jobs:cpu"

@@ -1,0 +1,14 @@
+jupyterlab
+anuga
+mpi4py
+pydantic
+requests
+httpx
+pandas
+matplotlib
+osmnx 
+geopandas
+folium 
+ipyleaflet 
+ipywidgets
+notebook

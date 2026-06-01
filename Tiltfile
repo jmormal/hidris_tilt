@@ -3,6 +3,49 @@
 # If you named your cluster differently, update this string.
 allow_k8s_contexts("k3d-hidris")
 
+load("ext://helm_resource", "helm_resource", "helm_repo")
+
+# ── Config & secrets ──────────────────────────────────────────────────────────
+# Externalized env lives in two files at the repo root:
+#   config.env  -> non-secret shared config (committed)  -> ConfigMap app-config
+#   .env        -> secret values (gitignored)            -> Secret    app-secrets
+# Change a host/url/credential in ONE place; every service picks it up via
+# envFrom. Per-service values (e.g. a worker's QUEUE) stay inline in the pod.
+
+def parse_env(text):
+    out = {}
+    for line in str(text).splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        out[k.strip()] = v.strip().strip('"').strip("'")
+    return out
+
+def env_to_yaml(d):
+    return "".join(['  {}: "{}"\n'.format(k, v) for k, v in d.items()])
+
+config_vars = parse_env(read_file("./config.env", default=""))
+secret_vars = parse_env(read_file("./.env", default=""))
+
+if not secret_vars:
+    fail("No secrets found. Copy .env.example to .env and fill it in.")
+
+k8s_yaml(blob("""apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+data:
+""" + env_to_yaml(config_vars)))
+
+k8s_yaml(blob("""apiVersion: v1
+kind: Secret
+metadata:
+  name: app-secrets
+type: Opaque
+stringData:
+""" + env_to_yaml(secret_vars)))
+
 # ── Helper: build + deploy one service ────────────────────────────────────────
 def service_js(name, port):
     docker_build(
@@ -44,10 +87,33 @@ def service_python(name, port):
         links=[link("http://" + name + ".127.0.0.1.nip.io", name)],
     )
 
+# ── Helper: build a worker image (used by KEDA ScaledJobs) ────────────────────
+# One image per worker type (cpu/gpu). Each folder has its own Dockerfile that
+# defines the ENTRYPOINT, so we don't override it here. Workers run RUN-ONCE:
+# pull one item from QUEUE, process it, exit 0 — they must NOT loop.
+#
+# live_pip=False for heavy images (e.g. the ANUGA GPU build): only sync source
+# on change, never rerun pip in-cluster. A requirements.txt change then needs a
+# full rebuild (correct — it sits on top of a multi-GB compiled base).
+def worker_build(image, src, live_pip=True):
+    updates = [sync(src + "/src", "/app/src")]
+    if live_pip:
+        updates.append(
+            run(
+                "cd /app && pip install -r requirements.txt",
+                trigger=[src + "/requirements.txt"],
+            )
+        )
+    docker_build(image, src, live_update=updates)
+
+# ── Helper: deploy a prebuilt off-the-shelf image ─────────────────────────────
+def service_image(name, links=[]):
+    k8s_yaml("./k8s/" + name + ".yaml")
+    k8s_resource(name, links=links)
+
 # ── Services ──────────────────────────────────────────────────────────────────
 service_js("frontend", 3000)
 service_python("api",      8080)
-
 
 # Jupyter
 #
@@ -66,4 +132,45 @@ k8s_resource(
     workload="jupyter",
     new_name="jupyter",
     links=[link("http://jupyter.127.0.0.1.nip.io", "jupyter")],
+)
+
+# ── Workers ───────────────────────────────────────────────────────────────────
+# Two images, two folders, two Dockerfiles. CPU is slim; GPU carries CUDA+torch.
+# No k8s_resource here — KEDA creates ephemeral Jobs from these images on demand
+# (worker-cpu <- jobs:cpu, worker-gpu <- jobs:gpu). See keda-*.yaml below.
+worker_build("worker-cpu", "./services/worker-cpu")
+worker_build("worker-gpu", "./services/worker-gpu", live_pip=False)
+
+# ── Infra (prebuilt images) ───────────────────────────────────────────────────
+service_image("minio", links=[link("http://minio.127.0.0.1.nip.io", "minio console")])
+service_image("redis")
+service_image("mlflow", links=[link("http://mlflow.127.0.0.1.nip.io", "mlflow")])
+
+# ── KEDA (cluster-wide autoscaler operator) ───────────────────────────────────
+# KEDA is an operator, not a single Deployment — install it via Helm, then
+# apply ScaledJobs that spawn worker Jobs on demand.
+helm_repo("kedacore", "https://kedacore.github.io/charts")
+helm_resource(
+    "keda",
+    "kedacore/keda",
+    namespace="keda",
+    flags=["--create-namespace"],
+    resource_deps=["kedacore"],
+)
+
+# ScaledJobs: each spawns one worker Job per queued Redis item. Split per type
+# so cpu/gpu can be read, deployed, and disabled independently. Both depend on
+# KEDA (for the CRDs) + redis (the trigger source).
+k8s_yaml("./k8s/keda-cpu.yaml")
+k8s_resource(
+    new_name="keda-cpu",
+    objects=["worker-cpu:scaledjob"],
+    resource_deps=["keda", "redis"],
+)
+
+k8s_yaml("./k8s/keda-gpu.yaml")
+k8s_resource(
+    new_name="keda-gpu",
+    objects=["worker-gpu:scaledjob"],
+    resource_deps=["keda", "redis"],
 )

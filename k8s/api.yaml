@@ -14,11 +14,11 @@ spec:
       containers:
         - name: api
           image: api
+          envFrom:
+            - configMapRef:
+                name: app-config
           ports:
             - containerPort: 8080
-          resources:
-            limits:
-              nvidia.com/gpu: 1
           readinessProbe:
             httpGet:
               path: /health

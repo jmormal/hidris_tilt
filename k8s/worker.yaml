@@ -1,0 +1,54 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker-cpu
+spec:
+  selector:
+    matchLabels:
+      app: worker-cpu
+  template:
+    metadata:
+      labels:
+        app: worker-cpu
+    spec:
+      containers:
+        - name: worker
+          image: worker
+          envFrom:
+            - configMapRef:
+                name: app-config
+            - secretRef:
+                name: app-secrets
+          env:
+            # Per-pool value — stays inline, NOT in the shared config.
+            - name: QUEUE
+              value: "jobs:cpu"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker-gpu
+spec:
+  selector:
+    matchLabels:
+      app: worker-gpu
+  template:
+    metadata:
+      labels:
+        app: worker-gpu
+    spec:
+      containers:
+        - name: worker
+          image: worker
+          envFrom:
+            - configMapRef:
+                name: app-config
+            - secretRef:
+                name: app-secrets
+          env:
+            # Per-pool value — stays inline, NOT in the shared config.
+            - name: QUEUE
+              value: "jobs:gpu"
+          resources:
+            limits:
+              nvidia.com/gpu: 1

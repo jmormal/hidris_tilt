@@ -1,0 +1,37 @@
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: worker-cpu
+spec:
+  scaleTargetRef:
+    name: worker-cpu
+  minReplicaCount: 1
+  maxReplicaCount: 10
+  cooldownPeriod: 60
+  pollingInterval: 15
+  triggers:
+    - type: redis
+      metadata:
+        address: redis:6379
+        listName: jobs:cpu
+        listLength: "5"
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: worker-gpu
+spec:
+  scaleTargetRef:
+    name: worker-gpu
+  # Scale to zero when idle so the GPU isn't held while the queue is empty.
+  minReplicaCount: 0
+  maxReplicaCount: 4
+  cooldownPeriod: 120
+  pollingInterval: 15
+  triggers:
+    - type: redis
+      metadata:
+        address: redis:6379
+        listName: jobs:gpu
+        # One GPU job per replica — scale up as soon as anything is queued.
+        listLength: "1"
