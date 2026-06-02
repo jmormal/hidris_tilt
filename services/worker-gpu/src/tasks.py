@@ -1,0 +1,493 @@
+"""
+tasks.py — RQ task + CUDA/GPU-accelerated ANUGA simulation in ONE file.
+
+Unlike the MPI variant, GPU mode in ANUGA runs in a SINGLE process: there is no
+mesh distribution, no rank gather, and no self-relaunch under mpiexec. The RQ
+worker can build the domain and evolve it directly. GPU acceleration is enabled
+via domain.set_multiprocessor_mode(2) (the same switch dana_benchmark.py uses
+for its "gpu" worker).
+
+Because everything runs in one process, the original in-memory save logic
+(build_result_skeleton / append_timestep / filter_active_mesh) reads centroid
+values straight off the domain — no MPI collective is needed.
+
+Env vars:
+  ANUGA_GPU_MODE      multiprocessor mode int  (default: 2)
+  ANUGA_ELEVATION     path to the .asc DEM     (default: ./src/mi_terreno.asc)
+  TETIS_REDIS_URL     redis url for progress   (default: redis://redis:6379)
+
+Optionally still supports running out-of-process (so a long GPU run doesn't
+block the RQ worker) via ANUGA_GPU_SUBPROCESS=1, which re-invokes this file
+with --gpu-worker. By default it runs in-process.
+"""
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+
+import numpy as np
+import geopandas as gpd
+from shapely.geometry import Polygon
+from pydantic import BaseModel
+
+
+# ===========================================================================
+# Data model
+# ===========================================================================
+
+
+class Vertex(BaseModel):
+    lat: float
+    lon: float
+
+
+class Triangle(BaseModel):
+    vertices: tuple[int, int, int]
+    elevation: float
+    friction: float
+    stage: list[float]
+    depth: list[float]
+    xmomentum: list[float]
+    ymomentum: list[float]
+    speed: list[float]
+    xvelocity: list[float]
+    yvelocity: list[float]
+
+
+class SimulationResult(BaseModel):
+    times: list[float]
+    vertices: list[Vertex]
+    triangles: list[Triangle]
+
+
+# ===========================================================================
+# PART 1 — RQ launcher (runs in the single RQ worker process)
+# ===========================================================================
+
+
+def run_anuga(
+    payload,
+    src_epsg=4326,
+    dst_epsg=25830,
+    output_name="simulation",
+    yieldstep=20,
+):
+    """RQ entrypoint. Runs the GPU simulation, either in-process (default) or
+    out-of-process via `tasks.py --gpu-worker` when ANUGA_GPU_SUBPROCESS=1."""
+    from rq import get_current_job
+    from events import channel_for, encode
+
+    print("WORKER: Received job. Starting GPU simulation...")
+    job = get_current_job()
+    job_id = job.id if job is not None else "local"
+
+    use_subprocess = os.getenv("ANUGA_GPU_SUBPROCESS", "0") == "1"
+    elevation_file = os.getenv("ANUGA_ELEVATION", "./src/mi_terreno.asc")
+    if not os.path.isabs(elevation_file):
+        elevation_file = os.path.abspath(elevation_file)
+
+    if not use_subprocess:
+        # ---- In-process path: just call the worker directly ----
+        args = argparse.Namespace(
+            payload=None,
+            result=None,
+            job_id=job_id,
+            output_name=f"{output_name}_{job_id}",
+            yieldstep=yieldstep,
+            src_epsg=src_epsg,
+            dst_epsg=dst_epsg,
+            elevation_file=elevation_file,
+            gpu_mode=int(os.getenv("ANUGA_GPU_MODE", "2")),
+        )
+        result_model = _run_gpu_worker(args, payload=payload)
+        result = result_model.model_dump()
+
+        if job is not None:
+            job.meta["progress"] = 1.0
+            job.meta["status_message"] = "Simulation complete"
+            job.save_meta()
+            job.connection.publish(
+                channel_for(job.id),
+                encode(
+                    "complete",
+                    {"job_id": job.id, "file": f"/api/simulate/{job.id}/result"},
+                ),
+            )
+        return result
+
+    # ---- Out-of-process path (optional) ----
+    workdir = tempfile.mkdtemp(prefix=f"anuga_{job_id}_")
+    payload_path = os.path.join(workdir, "payload.json")
+    result_path = os.path.join(workdir, "result.json")
+    this_file = os.path.abspath(__file__)
+
+    proc = None
+    try:
+        with open(payload_path, "w") as f:
+            json.dump(payload, f)
+
+        cmd = [
+            sys.executable,
+            "-u",
+            this_file,
+            "--gpu-worker",
+            "--payload",
+            payload_path,
+            "--result",
+            result_path,
+            "--job-id",
+            job_id,
+            "--output-name",
+            f"{output_name}_{job_id}",
+            "--yieldstep",
+            str(yieldstep),
+            "--src-epsg",
+            str(src_epsg),
+            "--dst-epsg",
+            str(dst_epsg),
+            "--elevation-file",
+            elevation_file,
+            "--gpu-mode",
+            os.getenv("ANUGA_GPU_MODE", "2"),
+        ]
+
+        print(f"WORKER: running: {' '.join(cmd)}")
+
+        env = os.environ.copy()
+        env.setdefault("OMP_NUM_THREADS", "1")
+
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            cwd=workdir,
+            env=env,
+        )
+
+        if job is not None:
+            job.meta["gpu_pid"] = proc.pid
+            job.save_meta()
+
+        captured = []
+        for line in proc.stdout:
+            print(line, end="")
+            captured.append(line)
+        proc.wait()
+
+        if proc.returncode != 0:
+            tail = "".join(captured[-60:]) or "(no output captured)"
+            raise RuntimeError(
+                f"GPU simulation failed (exit code {proc.returncode}).\n"
+                f"--- subprocess output (last 60 lines) ---\n{tail}"
+            )
+
+        with open(result_path) as f:
+            result = json.load(f)
+
+        if job is not None:
+            job.meta["progress"] = 1.0
+            job.meta["status_message"] = "Simulation complete"
+            job.save_meta()
+            job.connection.publish(
+                channel_for(job.id),
+                encode(
+                    "complete",
+                    {"job_id": job.id, "file": f"/api/simulate/{job.id}/result"},
+                ),
+            )
+
+        return result
+
+    finally:
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+# ===========================================================================
+# PART 2 — GPU worker (single process; imports anuga lazily)
+# ===========================================================================
+
+
+def _reproject_polygon(coordinates, src_epsg=4326, dst_epsg=25830):
+    raw_coords = coordinates[0]
+    # Frontend (DeckGL/GeoJSON) already sends [Lon, Lat] — no swap needed.
+    poly = Polygon(raw_coords)
+    gdf = gpd.GeoDataFrame(geometry=[poly], crs=f"EPSG:{src_epsg}")
+    gdf = gdf.to_crs(f"EPSG:{dst_epsg}")
+    return list(gdf.geometry[0].exterior.coords)
+
+
+def _build_result_skeleton(domain, dst_epsg=25830, src_epsg=4326):
+    """Build the vertex/triangle skeleton from the full mesh."""
+    nodes = domain.mesh.nodes
+    abs_nodes = domain.geo_reference.get_absolute(nodes)
+
+    gdf = gpd.GeoDataFrame(
+        geometry=gpd.points_from_xy(abs_nodes[:, 0], abs_nodes[:, 1]),
+        crs=f"EPSG:{dst_epsg}",
+    ).to_crs(f"EPSG:{src_epsg}")
+
+    vertices = [Vertex(lat=float(pt.y), lon=float(pt.x))
+                for pt in gdf.geometry]
+
+    tri_indices = domain.mesh.triangles
+    elevation = domain.quantities["elevation"].centroid_values.copy()
+    friction = domain.quantities["friction"].centroid_values.copy()
+
+    triangles = []
+    for i in range(len(tri_indices)):
+        triangles.append(
+            Triangle(
+                vertices=(
+                    int(tri_indices[i][0]),
+                    int(tri_indices[i][1]),
+                    int(tri_indices[i][2]),
+                ),
+                elevation=round(float(elevation[i]), 6),
+                friction=round(float(friction[i]), 6),
+                stage=[],
+                depth=[],
+                xmomentum=[],
+                ymomentum=[],
+                speed=[],
+                xvelocity=[],
+                yvelocity=[],
+            )
+        )
+
+    return SimulationResult(times=[], vertices=vertices, triangles=triangles)
+
+
+def _append_timestep(result, domain, t):
+    """Read centroid values straight off the (single-process) domain."""
+    stage = np.asarray(domain.quantities["stage"].centroid_values)
+    elev = np.asarray(domain.quantities["elevation"].centroid_values)
+    xmom = np.asarray(domain.quantities["xmomentum"].centroid_values)
+    ymom = np.asarray(domain.quantities["ymomentum"].centroid_values)
+
+    result.times.append(t)
+    depth = stage - elev
+    speed = np.sqrt(xmom**2 + ymom**2)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        xvel = np.where(depth > 1e-6, xmom / depth, 0.0)
+        yvel = np.where(depth > 1e-6, ymom / depth, 0.0)
+
+    for i, tri in enumerate(result.triangles):
+        tri.stage.append(round(float(stage[i]), 6))
+        tri.depth.append(round(float(depth[i]), 6))
+        tri.xmomentum.append(round(float(xmom[i]), 6))
+        tri.ymomentum.append(round(float(ymom[i]), 6))
+        tri.speed.append(round(float(speed[i]), 6))
+        tri.xvelocity.append(round(float(xvel[i]), 6))
+        tri.yvelocity.append(round(float(yvel[i]), 6))
+
+
+def _filter_active_mesh(result, depth_threshold=1e-5):
+    wet_triangles = []
+    used_vertex_indices = set()
+    for tri in result.triangles:
+        if max(tri.depth) > depth_threshold:
+            wet_triangles.append(tri)
+            used_vertex_indices.update(tri.vertices)
+
+    old_to_new = {}
+    new_vertices = []
+    for new_idx, old_idx in enumerate(sorted(used_vertex_indices)):
+        old_to_new[old_idx] = new_idx
+        old_v = result.vertices[old_idx]
+        new_vertices.append(Vertex(lat=old_v.lat, lon=old_v.lon))
+
+    remapped = []
+    for tri in wet_triangles:
+        remapped.append(
+            Triangle(
+                vertices=(
+                    old_to_new[tri.vertices[0]],
+                    old_to_new[tri.vertices[1]],
+                    old_to_new[tri.vertices[2]],
+                ),
+                elevation=tri.elevation,
+                friction=tri.friction,
+                stage=tri.stage,
+                depth=tri.depth,
+                xmomentum=tri.xmomentum,
+                ymomentum=tri.ymomentum,
+                speed=tri.speed,
+                xvelocity=tri.xvelocity,
+                yvelocity=tri.yvelocity,
+            )
+        )
+
+    return SimulationResult(
+        times=result.times, vertices=new_vertices, triangles=remapped
+    )
+
+
+def _publish_progress(job_id, pct, msg):
+    if not job_id or job_id == "local":
+        return
+    try:
+        from redis import Redis
+        from events import channel_for, encode
+
+        url = os.getenv("TETIS_REDIS_URL", "redis://redis:6379")
+        Redis.from_url(url).publish(
+            channel_for(job_id),
+            encode("progress", {"progress": pct, "status_message": msg}),
+        )
+    except Exception as e:
+        print(f"[tasks:gpu] progress publish failed: {e}")
+
+
+def _run_gpu_worker(args, payload=None):
+    """Single-process GPU simulation. Returns a SimulationResult.
+
+    If `payload` is given (in-process call), it's used directly; otherwise the
+    payload is read from args.payload and the result written to args.result.
+    """
+    import anuga
+
+    src_epsg, dst_epsg = args.src_epsg, args.dst_epsg
+
+    if payload is None:
+        with open(args.payload) as f:
+            payload = json.load(f)
+
+    config = payload["config"]
+    features = payload["features"]
+    duration = config["duration"]
+
+    # ---- Reproject all feature polygons ----
+    for ftype in ["region", "inlet", "rate", "elevation"]:
+        for feat in features.get(ftype, []):
+            feat["_coords_proj"] = _reproject_polygon(
+                feat["geometry"]["coordinates"], src_epsg, dst_epsg
+            )
+
+    region = features["region"][0]
+    abs_coords = region["_coords_proj"]
+    if abs_coords[0] == abs_coords[-1]:
+        abs_coords = abs_coords[:-1]
+    xs, ys = zip(*abs_coords)
+    xllcorner, yllcorner = min(xs), min(ys)
+    rel_coords = [[x - xllcorner, y - yllcorner] for x, y in abs_coords]
+
+    geo_ref = anuga.Geo_reference(
+        epsg=dst_epsg, xllcorner=xllcorner, yllcorner=yllcorner
+    )
+
+    boundary_tags = {}
+    for i, edge in enumerate(region["edges"]):
+        boundary_tags.setdefault(edge["boundary"], []).append(i)
+
+    domain = anuga.create_domain_from_regions(
+        rel_coords,
+        boundary_tags=boundary_tags,
+        maximum_triangle_area=config["mesh_max_area"],
+    )
+    domain.geo_reference = geo_ref
+    domain.set_name(args.output_name)
+    if config.get("flow_algorithm"):
+        domain.set_flow_algorithm(config["flow_algorithm"])
+
+    props = region["properties"]
+    domain.set_quantity(
+        "friction",
+        props.get("friction", config["manning_default"]),
+        location="centroids",
+    )
+    domain.set_quantity("stage", props.get(
+        "initial_stage", 0), location="centroids")
+    domain.set_quantity(
+        "elevation", filename=args.elevation_file, location="centroids")
+    domain.set_quantity("friction", 0.01, location="centroids")
+    domain.set_quantity("stage", expression="elevation", location="centroids")
+
+    result = _build_result_skeleton(
+        domain, dst_epsg=dst_epsg, src_epsg=src_epsg)
+    _publish_progress(args.job_id, 0, "Building domain")
+
+    domain.set_maximum_allowed_speed(20.0)  # Cap water speed at 20 m/s
+    domain.set_minimum_allowed_height(0.01)  # Ignore tiny puddles
+
+    # ---- Boundaries ----
+    bc_factory = {
+        "reflective": lambda: anuga.Reflective_boundary(domain),
+        "transmissive": lambda: anuga.Transmissive_boundary(domain),
+    }
+    domain.set_boundary({tag: bc_factory[tag]() for tag in boundary_tags})
+
+    # ---- Inlets ----
+    for inlet in features.get("inlet", []):
+        inlet_abs = inlet["_coords_proj"]
+        if inlet_abs[0] == inlet_abs[-1]:
+            inlet_abs = inlet_abs[:-1]
+
+        q = inlet["properties"]["Q"]
+        if isinstance(q, dict) and q.get("type") == "python":
+            ns = {}
+            exec(q["code"], {}, ns)
+            q = ns["Q"]
+
+        # Pass ABSOLUTE coordinates as a line; anuga offsets via geo_reference.
+        anuga.Inlet_operator(domain, inlet_abs, Q=q)
+
+    # ---- Enable GPU acceleration ----
+    # mode 2 = CUDA/GPU (same switch dana_benchmark.py uses for its gpu worker).
+    print(f"[tasks:gpu] enabling GPU mode {args.gpu_mode}")
+    domain.set_multiprocessor_mode(args.gpu_mode)
+
+    # ---- Evolve ----
+    for t in domain.evolve(yieldstep=60, duration=duration):
+        domain.print_timestepping_statistics()
+        _append_timestep(result, domain, float(t))
+        _publish_progress(args.job_id, round(t / duration * 100, 1), f"t={t}")
+
+    print("filtering mesh")
+    result = _filter_active_mesh(result, depth_threshold=1e-5)
+
+    # If invoked out-of-process, persist to disk.
+    if args.result is not None:
+        with open(args.result, "w") as f:
+            json.dump(result.model_dump(), f)
+        print(f"[tasks:gpu] wrote result to {args.result}")
+
+    _publish_progress(args.job_id, 100, "Simulation complete")
+    return result
+
+
+# ===========================================================================
+# Entrypoint router (only used for the optional out-of-process path)
+# ===========================================================================
+
+
+def _parse_gpu_args():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--gpu-worker", action="store_true")
+    ap.add_argument("--payload", required=True)
+    ap.add_argument("--result", required=True)
+    ap.add_argument("--job-id", default="local")
+    ap.add_argument("--output-name", default="simulation")
+    ap.add_argument("--yieldstep", type=float, default=20)
+    ap.add_argument("--src-epsg", type=int, default=4326)
+    ap.add_argument("--dst-epsg", type=int, default=25830)
+    ap.add_argument("--elevation-file", default="./src/mi_terreno.asc")
+    ap.add_argument("--gpu-mode", type=int, default=2)
+    return ap.parse_args()
+
+
+if __name__ == "__main__":
+    # Only reached for the optional out-of-process GPU path.
+    args = _parse_gpu_args()
+    _run_gpu_worker(args)

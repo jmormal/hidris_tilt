@@ -1,7 +1,3 @@
-# ─────────────────────────────────────────────────────────────────────────────
-# CPU worker ScaledJob. Spawns one Job per item on jobs:cpu.
-# Image: worker-cpu (slim, no CUDA). Run-once: LPOP one item, process, exit 0.
-# ─────────────────────────────────────────────────────────────────────────────
 apiVersion: keda.sh/v1alpha1
 kind: ScaledJob
 metadata:
@@ -19,16 +15,22 @@ spec:
       metadata:
         address: redis.default.svc.cluster.local:6379
         listName: rq:queue:jobs:cpu
-        # listName: jobs:cpu
         listLength: "1"
   jobTargetRef:
-    backoffLimit: 3
+    backoffLimit: 0  # Changed to 0. If MPI crashes, retrying immediately often just deadlocks again.
     template:
       spec:
         restartPolicy: Never
+        activeDeadlineSeconds: 3600 # Force K8s to kill the pod if it hangs longer than 1 hour
         containers:
           - name: worker
             image: worker-cpu
+            # Require at least 4 cores if ANUGA_NPROCS=4 is default
+            resources: 
+              requests:
+                cpu: "8" 
+              limits:
+                cpu: "8"
             envFrom:
               - configMapRef:
                   name: app-config
@@ -37,3 +39,15 @@ spec:
             env:
               - name: QUEUE
                 value: "jobs:cpu"
+              - name: PYTHONUNBUFFERED  # <-- ADD THIS
+                value: "1"              # <-- ADD THIS
+            # 1. MOUNT SHARED MEMORY HERE
+            volumeMounts:
+              - mountPath: /dev/shm
+                name: dshm
+        # 2. DEFINE THE IN-MEMORY VOLUME HERE
+        volumes:
+          - name: dshm
+            emptyDir:
+              medium: Memory
+              sizeLimit: "16Gi" # Adjust this based on your mesh size
