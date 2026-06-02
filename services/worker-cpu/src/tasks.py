@@ -8,6 +8,12 @@ from branca.colormap import LinearColormap
 from branca.element import MacroElement, Template
 from pydantic import BaseModel
 
+from rq import get_current_job
+from redis import Redis
+from events import channel_for, encode
+import os
+import os
+
 if not hasattr(anuga, "Compute_fluxes_boundary"):
     anuga.Compute_fluxes_boundary = type("Compute_fluxes_boundary", (), {})
 
@@ -72,8 +78,7 @@ def build_result_skeleton(domain, dst_epsg=25830, src_epsg=4326):
         crs=f"EPSG:{dst_epsg}",
     ).to_crs(f"EPSG:{src_epsg}")
 
-    vertices = [Vertex(lat=float(pt.y), lon=float(pt.x))
-                for pt in gdf.geometry]
+    vertices = [Vertex(lat=float(pt.y), lon=float(pt.x)) for pt in gdf.geometry]
 
     # --- Triangles: connectivity + static quantities ---
     tri_indices = domain.mesh.triangles  # (n_triangles, 3) vertex indices
@@ -199,11 +204,16 @@ def run_anuga(
     dst_epsg=25830,
     output_name="simulation",
     yieldstep=20,
-    duration=150,
+    # duration=150,
 ):
+
+    print("WORKER: Received job. Processing...")
+    job = get_current_job()
+
     payload = copy.deepcopy(payload)
     config = payload["config"]
     features = payload["features"]
+    duration = config["duration"]
 
     for ftype in ["region", "inlet", "rate", "elevation"]:
         for feat in features.get(ftype, []):
@@ -245,8 +255,22 @@ def run_anuga(
         props.get("friction", config["manning_default"]),
         location="centroids",
     )
-    domain.set_quantity("stage", props.get(
-        "initial_stage", 0), location="centroids")
+    domain.set_quantity("stage", props.get("initial_stage", 0), location="centroids")
+
+    if job is not None:
+        job.meta["progress"] = 0
+        job.meta["status_message"] = f"Setting boundry"
+        job.save_meta()
+        job.connection.publish(
+            channel_for(job.id),
+            encode(
+                "progress",
+                {
+                    "progress": 0,
+                    "status_message": f"Setting boundry",
+                },
+            ),
+        )
 
     bc_factory = {
         "reflective": lambda: anuga.Reflective_boundary(domain),
@@ -267,8 +291,24 @@ def run_anuga(
         inlet_region = anuga.Region(domain, polygon=inlet_rel)
         anuga.Inlet_operator(domain, inlet_region, Q=q)
 
+    if job is not None:
+        job.meta["progress"] = 0
+        job.meta["status_message"] = f"Setting Height"
+        job.save_meta()
+        job.connection.publish(
+            channel_for(job.id),
+            encode(
+                "progress",
+                {
+                    "progress": 0,
+                    "status_message": f"Setting heighit",
+                },
+            ),
+        )
+
     domain.set_quantity(
-        "elevation", filename="mi_terreno.asc", location="centroids")
+        "elevation", filename="./src/mi_terreno.asc", location="centroids"
+    )
     domain.set_quantity("friction", 0.01, location="centroids")
     domain.set_quantity("stage", expression="elevation", location="centroids")
 
@@ -277,8 +317,7 @@ def run_anuga(
     dplotter = Domain_plotter(domain)
 
     # Build skeleton with vertices + triangles (empty dynamic lists)
-    result = build_result_skeleton(
-        domain, dst_epsg=dst_epsg, src_epsg=src_epsg)
+    result = build_result_skeleton(domain, dst_epsg=dst_epsg, src_epsg=src_epsg)
 
     # Evolve and append each timestep
     for t in domain.evolve(yieldstep=yieldstep, duration=duration):
@@ -286,5 +325,32 @@ def run_anuga(
         dplotter.save_depth_frame()
         append_timestep(result, domain, float(t))
 
+        if job is not None:
+            job.meta["progress"] = t / duration
+            job.meta["status_message"] = f"The simulation is at the second {t}"
+            job.save_meta()
+            job.connection.publish(
+                channel_for(job.id),
+                encode(
+                    "progress",
+                    {
+                        "progress": round(t / duration * 100, 1),
+                        "status_message": f"t={t}",
+                    },
+                ),
+            )
+
     result = filter_active_mesh(result, depth_threshold=1e-5)
-    return domain, dplotter, result
+    if job is not None:
+        job.meta["progress"] = 1.0
+        job.meta["status_message"] = "Simulation complete"
+        job.save_meta()
+
+        job.connection.publish(
+            channel_for(job.id),
+            encode(
+                "complete",
+                {"job_id": job.id, "file": f"/api/simulate/{job.id}/result"},
+            ),
+        )
+    return result.model_dump()

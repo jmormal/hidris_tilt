@@ -5,6 +5,10 @@ allow_k8s_contexts("k3d-hidris")
 
 load("ext://helm_resource", "helm_resource", "helm_repo")
 
+# ── KEDA Custom Resource Support ──────────────────────────────────────────────
+# Teach Tilt where to inject the dynamically built image tags in ScaledJobs
+k8s_kind("ScaledJob", image_json_path="{.spec.jobTargetRef.template.spec.containers[*].image}")
+
 # ── Config & secrets ──────────────────────────────────────────────────────────
 # Externalized env lives in two files at the repo root:
 #   config.env  -> non-secret shared config (committed)  -> ConfigMap app-config
@@ -96,15 +100,7 @@ def service_python(name, port):
 # on change, never rerun pip in-cluster. A requirements.txt change then needs a
 # full rebuild (correct — it sits on top of a multi-GB compiled base).
 def worker_build(image, src, live_pip=True):
-    updates = [sync(src + "/src", "/app/src")]
-    if live_pip:
-        updates.append(
-            run(
-                "cd /app && pip install -r requirements.txt",
-                trigger=[src + "/requirements.txt"],
-            )
-        )
-    docker_build(image, src, live_update=updates)
+    docker_build(image, src)
 
 # ── Helper: deploy a prebuilt off-the-shelf image ─────────────────────────────
 def service_image(name, links=[]):
@@ -161,16 +157,17 @@ helm_resource(
 # ScaledJobs: each spawns one worker Job per queued Redis item. Split per type
 # so cpu/gpu can be read, deployed, and disabled independently. Both depend on
 # KEDA (for the CRDs) + redis (the trigger source).
+# ScaledJobs: each spawns one worker Job per queued Redis item. Split per type
+# so cpu/gpu can be read, deployed, and disabled independently. Both depend on
+# KEDA (for the CRDs) + redis (the trigger source).
 k8s_yaml("./k8s/keda-cpu.yaml")
 k8s_resource(
-    new_name="keda-cpu",
-    objects=["worker-cpu:scaledjob"],
+    "worker-cpu", # Target the auto-created resource directly
     resource_deps=["keda", "redis"],
 )
 
 k8s_yaml("./k8s/keda-gpu.yaml")
 k8s_resource(
-    new_name="keda-gpu",
-    objects=["worker-gpu:scaledjob"],
+    "worker-gpu", # Target the auto-created resource directly
     resource_deps=["keda", "redis"],
 )

@@ -12,3 +12,5 @@ folium
 ipyleaflet 
 ipywidgets
 notebook
+redis
+rq
