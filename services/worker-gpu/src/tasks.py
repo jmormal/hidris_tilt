@@ -238,8 +238,7 @@ def _build_result_skeleton(domain, dst_epsg=25830, src_epsg=4326):
         crs=f"EPSG:{dst_epsg}",
     ).to_crs(f"EPSG:{src_epsg}")
 
-    vertices = [Vertex(lat=float(pt.y), lon=float(pt.x))
-                for pt in gdf.geometry]
+    vertices = [Vertex(lat=float(pt.y), lon=float(pt.x)) for pt in gdf.geometry]
 
     tri_indices = domain.mesh.triangles
     elevation = domain.quantities["elevation"].centroid_values.copy()
@@ -368,6 +367,7 @@ def _run_gpu_worker(args, payload=None):
     features = payload["features"]
     duration = config["duration"]
 
+    yieldstep = config["output_timestep"]
     # ---- Reproject all feature polygons ----
     for ftype in ["region", "inlet", "rate", "elevation"]:
         for feat in features.get(ftype, []):
@@ -407,15 +407,12 @@ def _run_gpu_worker(args, payload=None):
         props.get("friction", config["manning_default"]),
         location="centroids",
     )
-    domain.set_quantity("stage", props.get(
-        "initial_stage", 0), location="centroids")
-    domain.set_quantity(
-        "elevation", filename=args.elevation_file, location="centroids")
+    domain.set_quantity("stage", props.get("initial_stage", 0), location="centroids")
+    domain.set_quantity("elevation", filename=args.elevation_file, location="centroids")
     domain.set_quantity("friction", 0.01, location="centroids")
     domain.set_quantity("stage", expression="elevation", location="centroids")
 
-    result = _build_result_skeleton(
-        domain, dst_epsg=dst_epsg, src_epsg=src_epsg)
+    result = _build_result_skeleton(domain, dst_epsg=dst_epsg, src_epsg=src_epsg)
     _publish_progress(args.job_id, 0, "Building domain")
 
     domain.set_maximum_allowed_speed(20.0)  # Cap water speed at 20 m/s
@@ -425,6 +422,15 @@ def _run_gpu_worker(args, payload=None):
     bc_factory = {
         "reflective": lambda: anuga.Reflective_boundary(domain),
         "transmissive": lambda: anuga.Transmissive_boundary(domain),
+    }
+    bc_factory = {
+        "reflective": lambda: anuga.Reflective_boundary(domain),
+        "tr1ansmissive": lambda: anuga.Transmissive_boundary(domain),
+        "transmissive": lambda: (
+            anuga.Transmissive_n_momentum_zero_t_momentum_set_stage_boundary(
+                domain, function=lambda t: -9999.0
+            )
+        ),
     }
     domain.set_boundary({tag: bc_factory[tag]() for tag in boundary_tags})
 
@@ -439,9 +445,10 @@ def _run_gpu_worker(args, payload=None):
             ns = {}
             exec(q["code"], {}, ns)
             q = ns["Q"]
-
+        inlet_rel = [[x - xllcorner, y - yllcorner] for x, y in inlet_abs]
+        anuga.Inlet_operator(domain, inlet_rel, Q=q)
         # Pass ABSOLUTE coordinates as a line; anuga offsets via geo_reference.
-        anuga.Inlet_operator(domain, inlet_abs, Q=q)
+        # anuga.Inlet_operator(domain, inlet_abs, Q=q)
 
     # ---- Enable GPU acceleration ----
     # mode 2 = CUDA/GPU (same switch dana_benchmark.py uses for its gpu worker).
@@ -449,7 +456,7 @@ def _run_gpu_worker(args, payload=None):
     domain.set_multiprocessor_mode(args.gpu_mode)
 
     # ---- Evolve ----
-    for t in domain.evolve(yieldstep=60, duration=duration):
+    for t in domain.evolve(yieldstep=yieldstep, duration=duration):
         domain.print_timestepping_statistics()
         _append_timestep(result, domain, float(t))
         _publish_progress(args.job_id, round(t / duration * 100, 1), f"t={t}")

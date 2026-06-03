@@ -36,7 +36,11 @@ import geopandas as gpd
 from shapely.geometry import Polygon
 from pydantic import BaseModel
 
+# ===========================================================================
+# Precision config
+# ===========================================================================
 
+PRECISION = 2  # decimals for all quantities except coordinates (lat/lon)
 # ===========================================================================
 # Data model
 # ===========================================================================
@@ -325,13 +329,13 @@ def _append_timestep(result, domain, t, myid):
         yvel = np.where(depth > 1e-6, ymom / depth, 0.0)
 
     for i, tri in enumerate(result.triangles):
-        tri.stage.append(round(float(stage[i]), 6))
-        tri.depth.append(round(float(depth[i]), 6))
-        tri.xmomentum.append(round(float(xmom[i]), 6))
-        tri.ymomentum.append(round(float(ymom[i]), 6))
-        tri.speed.append(round(float(speed[i]), 6))
-        tri.xvelocity.append(round(float(xvel[i]), 6))
-        tri.yvelocity.append(round(float(yvel[i]), 6))
+        tri.stage.append(round(float(stage[i]), PRECISION))
+        tri.depth.append(round(float(depth[i]), PRECISION))
+        tri.xmomentum.append(round(float(xmom[i]), PRECISION))
+        tri.ymomentum.append(round(float(ymom[i]), PRECISION))
+        tri.speed.append(round(float(speed[i]), PRECISION))
+        tri.xvelocity.append(round(float(xvel[i]), PRECISION))
+        tri.yvelocity.append(round(float(yvel[i]), PRECISION))
 
 
 def _filter_active_mesh(result, depth_threshold=1e-5):

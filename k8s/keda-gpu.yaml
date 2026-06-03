@@ -18,8 +18,8 @@ spec:
   triggers:
     - type: redis
       metadata:
-        address: redis:6379
-        listName: jobs:gpu
+        address: redis.default.svc.cluster.local:6379
+        listName: rq:queue:jobs:gpu
         listLength: "1"
   jobTargetRef:
     backoffLimit: 3
@@ -37,6 +37,21 @@ spec:
             env:
               - name: QUEUE
                 value: "jobs:gpu"
+              - name: PYTHONUNBUFFERED  # <-- ADD THIS
+                value: "1"              # <-- ADD THIS
             resources:
+              requests:
+                memory: "24Gi"
+                cpu: "2"
               limits:
+                memory: "28Gi"
                 nvidia.com/gpu: 1
+            volumeMounts:
+              - mountPath: /dev/shm
+                name: dshm
+        # 2. DEFINE THE IN-MEMORY VOLUME HERE
+        volumes:
+          - name: dshm
+            emptyDir:
+              medium: Memory
+              sizeLimit: "16Gi" # Adjust this based on your mesh size
