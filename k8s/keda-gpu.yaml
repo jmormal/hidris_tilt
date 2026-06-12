@@ -9,7 +9,7 @@ metadata:
   name: worker-gpu
 spec:
   scalingStrategy:
-    strategy: default
+    strategy: eager
   minReplicaCount: 0
   maxReplicaCount: 4
   pollingInterval: 15
