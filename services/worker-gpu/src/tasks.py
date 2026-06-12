@@ -34,10 +34,12 @@ import geopandas as gpd
 from shapely.geometry import Polygon
 from pydantic import BaseModel
 
+import gzip
 
 # ===========================================================================
 # Data model
 # ===========================================================================
+PRECISION_SAVE = 1
 
 
 class Vertex(BaseModel):
@@ -103,8 +105,7 @@ def run_anuga(
             elevation_file=elevation_file,
             gpu_mode=int(os.getenv("ANUGA_GPU_MODE", "2")),
         )
-        result_model = _run_gpu_worker(args, payload=payload)
-        result = result_model.model_dump()
+        result = _run_gpu_worker(args, payload=payload)
 
         if job is not None:
             job.meta["progress"] = 1.0
@@ -253,8 +254,8 @@ def _build_result_skeleton(domain, dst_epsg=25830, src_epsg=4326):
                     int(tri_indices[i][1]),
                     int(tri_indices[i][2]),
                 ),
-                elevation=round(float(elevation[i]), 6),
-                friction=round(float(friction[i]), 6),
+                elevation=round(float(elevation[i]), PRECISION_SAVE),
+                friction=round(float(friction[i]), PRECISION_SAVE),
                 stage=[],
                 depth=[],
                 xmomentum=[],
@@ -283,13 +284,13 @@ def _append_timestep(result, domain, t):
         yvel = np.where(depth > 1e-6, ymom / depth, 0.0)
 
     for i, tri in enumerate(result.triangles):
-        tri.stage.append(round(float(stage[i]), 6))
-        tri.depth.append(round(float(depth[i]), 6))
-        tri.xmomentum.append(round(float(xmom[i]), 6))
-        tri.ymomentum.append(round(float(ymom[i]), 6))
-        tri.speed.append(round(float(speed[i]), 6))
-        tri.xvelocity.append(round(float(xvel[i]), 6))
-        tri.yvelocity.append(round(float(yvel[i]), 6))
+        tri.stage.append(round(float(stage[i]), PRECISION_SAVE))
+        tri.depth.append(round(float(depth[i]), PRECISION_SAVE))
+        tri.xmomentum.append(round(float(xmom[i]), PRECISION_SAVE))
+        tri.ymomentum.append(round(float(ymom[i]), PRECISION_SAVE))
+        tri.speed.append(round(float(speed[i]), PRECISION_SAVE))
+        tri.xvelocity.append(round(float(xvel[i]), PRECISION_SAVE))
+        tri.yvelocity.append(round(float(yvel[i]), PRECISION_SAVE))
 
 
 def _filter_active_mesh(result, depth_threshold=1e-5):
@@ -369,7 +370,7 @@ def _run_gpu_worker(args, payload=None):
 
     yieldstep = config["output_timestep"]
     # ---- Reproject all feature polygons ----
-    for ftype in ["region", "inlet", "rate", "elevation"]:
+    for ftype in ["region", "inlet", "rate", "elevation", "meshResolution"]:
         for feat in features.get(ftype, []):
             feat["_coords_proj"] = _reproject_polygon(
                 feat["geometry"]["coordinates"], src_epsg, dst_epsg
@@ -391,15 +392,30 @@ def _run_gpu_worker(args, payload=None):
     for i, edge in enumerate(region["edges"]):
         boundary_tags.setdefault(edge["boundary"], []).append(i)
 
+    interior_regions = []
+    # ---- Inlets ----
+    for region in features.get("meshResolution", []):
+        region_abs = region["_coords_proj"]
+        if region_abs[0] == region_abs[-1]:
+            region_abs = region_abs[:-1]
+
+        resolution = region["properties"]["resolution"]
+        region_rel = [[x - xllcorner, y - yllcorner] for x, y in region_abs]
+        interior_regions.append([region_rel, resolution])
+        # Pass ABSOLUTE coordinates as a line; anuga offsets via geo_reference.
+        # anuga.Inlet_operator(domain, inlet_abs, Q=q)
+
     domain = anuga.create_domain_from_regions(
         rel_coords,
         boundary_tags=boundary_tags,
         maximum_triangle_area=config["mesh_max_area"],
+        interior_regions=interior_regions,
     )
     domain.geo_reference = geo_ref
     domain.set_name(args.output_name)
     if config.get("flow_algorithm"):
         domain.set_flow_algorithm(config["flow_algorithm"])
+        print(f"Flow algorith {config['flow_algorithm']}")
 
     props = region["properties"]
     domain.set_quantity(
@@ -470,7 +486,14 @@ def _run_gpu_worker(args, payload=None):
             json.dump(result.model_dump(), f)
         print(f"[tasks:gpu] wrote result to {args.result}")
 
+    print("gziping")
     _publish_progress(args.job_id, 100, "Simulation complete")
+    json_bytes = result.model_dump_json().encode("utf-8")
+    result = gzip.compress(json_bytes)
+    size_bytes = len(result)
+    size_mb = size_bytes / (1024 * 1024)
+    print(f"Compressed payload size: {size_bytes} bytes ({size_mb:.2f} MB)")
+    print("done")
     return result
 
 
