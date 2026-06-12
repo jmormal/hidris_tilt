@@ -39,6 +39,7 @@ ENV OMP_NUM_THREADS=1
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+COPY mesh/ /app/src/
 COPY src/ /app/src/
 
 
