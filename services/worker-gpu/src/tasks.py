@@ -382,6 +382,27 @@ def _make_q(q_spec):
     return q_spec  # plain scalar
 
 
+def _make_rate(q_spec):
+    """Discharge spec -> scalar or callable(t).
+
+    WARNING: the 'python' form exec()s payload code in this worker — that is
+    remote code execution if the API is ever exposed beyond trusted users.
+    Prefer sending a hydrograph as [[t, Q], ...] pairs (handled below).
+    """
+    if isinstance(q_spec, dict):
+        if q_spec.get("type") == "python":
+            ns = {}
+            exec(q_spec["code"], {}, ns)  # noqa: S102 — trusted payloads only
+            return ns["Q"]
+        if q_spec.get("type") == "series":
+            pts = np.asarray(q_spec["points"], dtype=float)  # [[t, Q], ...]
+            ts, qs = pts[:, 0], pts[:, 1]
+            return lambda t: float(np.interp(t, ts, qs))
+    else:
+        q_spec = q_spec * 1e-3 / 3600.0
+    return q_spec  # plain scalar
+
+
 def _run_gpu_worker(args, payload=None):
     """Single-process GPU simulation. Returns gzipped JSON bytes of a
     SimulationResult. If args.result is set, also writes those bytes there."""
@@ -399,7 +420,14 @@ def _run_gpu_worker(args, payload=None):
     yieldstep = config.get("output_timestep", args.yieldstep)
 
     # ---- Reproject all feature polygons ----
-    for ftype in ["region", "inlet", "rate", "elevation", "meshResolution"]:
+    for ftype in [
+        "region",
+        "inlet",
+        "rate",
+        "elevation",
+        "interiorBoundry",
+        "meshResolution",
+    ]:
         for feat in features.get(ftype, []):
             feat["_coords_proj"] = _reproject_polygon(
                 feat["geometry"]["coordinates"], src_epsg, dst_epsg
@@ -427,11 +455,17 @@ def _run_gpu_worker(args, payload=None):
         res_rel = [[x - xllcorner, y - yllcorner] for x, y in res_abs]
         interior_regions.append([res_rel, resolution])
 
+    interior_holes = []
+    for res_feat in features.get("interiorBoundry", []):  # NOTE: not `region`!
+        res_abs = res_feat["_coords_proj"]
+        res_rel = [[x - xllcorner, y - yllcorner] for x, y in res_abs]
+        interior_holes.append(res_rel)
     domain = anuga.create_domain_from_regions(
         rel_coords,
         boundary_tags=boundary_tags,
         maximum_triangle_area=config["mesh_max_area"],
         interior_regions=interior_regions,
+        interior_holes=interior_holes,
     )
     domain.geo_reference = geo_ref
     domain.set_name(args.output_name)
@@ -458,6 +492,7 @@ def _run_gpu_worker(args, payload=None):
 
     domain.set_minimum_allowed_height(0.01)  # Ignore tiny puddles
 
+    domain.set_evolve_max_timestep(5.0)  # cap the cold-start step
     # ---- Boundaries (GPU-native types only -> keeps the fused C RK loop) ----
     bc_factory = {
         "reflective": lambda: anuga.Reflective_boundary(domain),
@@ -467,7 +502,11 @@ def _run_gpu_worker(args, payload=None):
             )
         ),
     }
-    domain.set_boundary({tag: bc_factory[tag]() for tag in boundary_tags})
+    boundries = {tag: bc_factory[tag]() for tag in boundary_tags}
+    print(f" interior holes{interior_holes}")
+    if len(interior_holes) > 0:
+        boundries["interior"] = bc_factory["reflective"]()
+    domain.set_boundary(boundries)
 
     # ---- Inflows ----
     # Rate_operator.inflow is GPU-resident (rate cached on device, one kernel
@@ -480,6 +519,12 @@ def _run_gpu_worker(args, payload=None):
         q = _make_q(inlet["properties"]["Q"])
         inlet_rel = [[x - xllcorner, y - yllcorner] for x, y in inlet_abs]
         anuga.Rate_operator.inflow(domain, rate=q, polygon=inlet_rel)
+
+    for inlet in features.get("rate", []):
+        inlet_abs = _close_ring_removed(inlet["_coords_proj"])
+        q = _make_rate(inlet["properties"]["rate"])
+        inlet_rel = [[x - xllcorner, y - yllcorner] for x, y in inlet_abs]
+        anuga.Rate_operator(domain, rate=q, polygon=inlet_rel)
     B = []
     print(features)
     B = []
