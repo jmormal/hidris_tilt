@@ -57,12 +57,12 @@ def service_js(name, port):
         "./services/" + name,
         entrypoint=["npm", "run", "dev"],
         live_update=[
+            sync("./services/frontend/package.json", "/app/package.json"),
+            sync("./services/frontend/package-lock.json", "/app/package-lock.json"),
             sync("./services/frontend/src", "/app/src"),
             sync("./services/frontend/public", "/app/public"),
-            run(
-                "cd /app && npm install",
-                trigger=["./services/frontend/package.json"],
-            ),
+            run("cd /app && npm ci && rm -rf node_modules/.vite",
+                trigger=["./services/frontend/package.json"]),
         ],
     )
     k8s_yaml("./k8s/" + name + ".yaml")

@@ -24,3 +24,4 @@ k3d cluster create "${CLUSTER_NAME}" \
   --volume "$(pwd)/services/jupyter/notebooks:/mnt/notebooks@server:0"
 
 k3d kubeconfig merge "${CLUSTER_NAME}" --kubeconfig-merge-default
+kubectl apply -f https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/v0.14.5/nvidia-device-plugin.yml
