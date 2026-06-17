@@ -1,2 +1,5 @@
 services/jupyter/
 *.asc
+/services/worker-gpu/mesh/MDT_malla_5m_etrs89h30
+/services/worker-gpu/mesh/MDT_malla_5m_etrs89h30.ers
+/services/worker-gpu/oldmesh/mi_terreno_whole.tif.aux.xml

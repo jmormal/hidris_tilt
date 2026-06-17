@@ -34,6 +34,11 @@ Env vars:
                         and GPU state is fully released between jobs).
 """
 
+import pyproj
+from shapely.ops import transform
+from shapely.geometry import polygon, shape
+from rasterio.mask import mask
+import rasterio
 import argparse
 import gzip
 import json
@@ -58,6 +63,43 @@ PRECISION_SAVE = 1  # decimals kept in the JSON. NOTE: depths < 0.05 m round
 # the size cost small).
 
 
+def clip_dem_to_asc(
+    coordinates,
+    ers_path="./src/MDT_malla_5m_etrs89h30.ers",
+    src_epsg=4326,
+    out_path="mi_terreno.asc",
+):
+    # `coordinates` is the GeoJSON Polygon ring: [[[lon,lat], ...]]
+    poly = Polygon(coordinates[0])
+
+    with rasterio.open(ers_path) as src:
+        # reproject the polygon into the DEM's own CRS (don't hardcode)
+        project = pyproj.Transformer.from_crs(
+            f"EPSG:{src_epsg}", src.crs, always_xy=True
+        ).transform
+        poly_proj = transform(project, poly)
+
+        nodata = src.nodata if src.nodata is not None else -9999
+        img, tr = mask(src, [poly_proj.__geo_interface__], crop=True, nodata=nodata)
+
+        meta = src.meta.copy()
+        meta.update(
+            driver="AAIGrid",  # <- the -of AAIGrid part
+            height=img.shape[1],
+            width=img.shape[2],
+            count=1,  # AAIGrid is single-band only
+            transform=tr,
+            nodata=nodata,
+            crs=src.crs,
+            dtype=img.dtype,
+        )
+
+        with rasterio.open(out_path, "w", **meta) as dst:
+            dst.write(img[0], 1)  # write first band only
+
+    return out_path
+
+
 class Vertex(BaseModel):
     lat: float
     lon: float
@@ -65,15 +107,15 @@ class Vertex(BaseModel):
 
 class Triangle(BaseModel):
     vertices: tuple[int, int, int]
-    elevation: float
-    friction: float
-    stage: list[float]
+    # elevation: float
+    # friction: float
+    # stage: list[float]
     depth: list[float]
-    xmomentum: list[float]
-    ymomentum: list[float]
+    # xmomentum: list[float]
+    # ymomentum: list[float]
     speed: list[float]
-    xvelocity: list[float]
-    yvelocity: list[float]
+    # xvelocity: list[float]
+    # yvelocity: list[float]
 
 
 class SimulationResult(BaseModel):
@@ -84,7 +126,7 @@ class SimulationResult(BaseModel):
 
 # ===========================================================================
 # PART 1 — RQ launcher (runs in the single RQ worker process)
-# ===========================================================================
+# ==========================================================tif=================
 
 
 def run_anuga(
@@ -107,9 +149,11 @@ def run_anuga(
     job_id = job.id if job is not None else "local"
 
     use_subprocess = os.getenv("ANUGA_GPU_SUBPROCESS", "0") == "1"
-    elevation_file = os.getenv("ANUGA_ELEVATION", "./src/mi_terreno.asc")
+    elevation_file = os.getenv("ANUGA_ELEVATION", "./src/mi_terreno_whole.tif")
     if not os.path.isabs(elevation_file):
         elevation_file = os.path.abspath(elevation_file)
+
+    print(elevation_file)
 
     def _notify_complete():
         if job is not None:
@@ -332,15 +376,15 @@ def _finalize_result(
                     int(remapped[w, 1]),
                     int(remapped[w, 2]),
                 ),
-                elevation=float(elev_r[i]),
-                friction=float(fric_r[i]),
-                stage=stage_t[i].tolist(),
+                # elevation=float(elev_r[i]),
+                # friction=float(fric_r[i]),
+                # stage=stage_t[i].tolist(),
                 depth=depth_t[i].tolist(),
-                xmomentum=xmom_t[i].tolist(),
-                ymomentum=ymom_t[i].tolist(),
+                # xmomentum=xmom_t[i].tolist(),
+                # ymomentum=ymom_t[i].tolist(),
                 speed=speed_t[i].tolist(),
-                xvelocity=xvel_t[i].tolist(),
-                yvelocity=yvel_t[i].tolist(),
+                # xvelocity=xvel_t[i].tolist(),
+                # yvelocity=yvel_t[i].tolist(),
             )
         )
 
@@ -393,7 +437,7 @@ def _make_rate(q_spec):
         if q_spec.get("type") == "python":
             ns = {}
             exec(q_spec["code"], {}, ns)  # noqa: S102 — trusted payloads only
-            return ns["Q"]
+            return ns["rate"]
         if q_spec.get("type") == "series":
             pts = np.asarray(q_spec["points"], dtype=float)  # [[t, Q], ...]
             ts, qs = pts[:, 0], pts[:, 1]
@@ -433,6 +477,16 @@ def _run_gpu_worker(args, payload=None):
                 feat["geometry"]["coordinates"], src_epsg, dst_epsg
             )
 
+            if ftype == "region":
+                elevation_file = clip_dem_to_asc(
+                    feat["geometry"]["coordinates"],
+                    ers_path="./src/MDT_malla_5m_etrs89h30.ers",
+                    src_epsg=4326,
+                    # dst_epsg=25830,
+                    out_path="region.asc",
+                )
+
+    print(f" elevation filw {elevation_file}")
     sim_region = features["region"][0]
     abs_coords = _close_ring_removed(sim_region["_coords_proj"])
     xs, ys = zip(*abs_coords)
@@ -442,7 +496,6 @@ def _run_gpu_worker(args, payload=None):
     geo_ref = anuga.Geo_reference(
         epsg=dst_epsg, xllcorner=xllcorner, yllcorner=yllcorner
     )
-
     boundary_tags = {}
     for i, edge in enumerate(sim_region["edges"]):
         boundary_tags.setdefault(edge["boundary"], []).append(i)
@@ -468,8 +521,23 @@ def _run_gpu_worker(args, payload=None):
         interior_holes=interior_holes,
     )
     domain.geo_reference = geo_ref
+    # domain.set_zone(dst_epsg - 25800)  # 30
+    # domain.geo_reference.zone = dst_epsg - 25800
+    # domain.geo_reference.south = False  # ETRS89/UTM30N is northern
+    # domain.geo_reference.hemisphere = "north"
     domain.set_name(args.output_name)
+    # utm_zone = dst_epsg - 25800
+    # domain.set_zone(utm_zone)
     domain.set_store(False)  # JSON is the product; skip per-yieldstep .sww
+    gr = domain.geo_reference
+    print("=== ZONE DEBUG ===")
+    print("domain.get_zone():", domain.get_zone())
+    print("geo_reference.zone:", getattr(gr, "zone", "MISSING"))
+    print(
+        "geo_reference.south / hemisphere:",
+        getattr(gr, "south", getattr(gr, "hemisphere", "MISSING")),
+    )
+    print("==================")
     if config.get("flow_algorithm"):
         # Cost per step on GPU: DE0 ~1x (Euler, ANUGA default),
         # DE_ader2 ~1.1x (2nd order in time), DE1 ~2x (RK2), DE2 ~3x (RK3).
@@ -477,7 +545,7 @@ def _run_gpu_worker(args, payload=None):
 
     # ---- Quantities (order matters: elevation before stage expression) ----
     props = sim_region["properties"]
-    domain.set_quantity("elevation", filename=args.elevation_file, location="centroids")
+    domain.set_quantity("elevation", filename=elevation_file, location="centroids")
     domain.set_quantity(
         "friction",
         props.get("friction", config.get("manning_default", 0.03)),
@@ -492,13 +560,14 @@ def _run_gpu_worker(args, payload=None):
 
     domain.set_minimum_allowed_height(0.01)  # Ignore tiny puddles
 
+    domain.set_maximum_allowed_speed(20.0)  # Cap water speed at 20 m/s
     domain.set_evolve_max_timestep(5.0)  # cap the cold-start step
     # ---- Boundaries (GPU-native types only -> keeps the fused C RK loop) ----
     bc_factory = {
         "reflective": lambda: anuga.Reflective_boundary(domain),
         "transmissive": lambda: (
             anuga.Transmissive_n_momentum_zero_t_momentum_set_stage_boundary(
-                domain, function=lambda t: -9999.0
+                domain, function=lambda t: 0
             )
         ),
     }
@@ -573,6 +642,7 @@ def _run_gpu_worker(args, payload=None):
 
     print("gziping")
     _publish_progress(args.job_id, 100, "Simulation complete")
+    print(result)
     json_bytes = result.model_dump_json().encode("utf-8")
     gz = gzip.compress(json_bytes)
     size_mb = len(gz) / (1024 * 1024)

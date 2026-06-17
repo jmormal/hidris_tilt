@@ -1,3 +1,5 @@
+rasterio
+pyproj
 jupyterlab
 anuga
 mpi4py
