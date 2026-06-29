@@ -39,6 +39,20 @@ spec:
                 value: "jobs:gpu"
               - name: PYTHONUNBUFFERED  # <-- ADD THIS
                 value: "1"              # <-- ADD THIS
+              - name: PG_USER
+                valueFrom:
+                  secretKeyRef:
+                    name: hidris-db-app
+                    key: username
+              - name: PG_PASSWORD
+                valueFrom:
+                  secretKeyRef:
+                    name: hidris-db-app
+                    key: password
+              - name: DB_HOST
+                value: "hidris-db-rw"
+              - name: DB_NAME
+                value: "hidris"
             resources:
               requests:
                 memory: "24Gi"

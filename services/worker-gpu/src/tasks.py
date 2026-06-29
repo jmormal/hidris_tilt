@@ -1,37 +1,30 @@
 """
 tasks.py — RQ task + GPU-accelerated ANUGA simulation in ONE file.
 
-Refactored version. Changes vs the original:
+Job envelope (new):
+  The RQ job arrives as {"public_id": "<uuid>", "payload": {config, features}}.
+  run_anuga unwraps it; a bare {config, features} payload still works as a
+  fallback. On completion the gzipped SimulationResult is written to Postgres
+  (keyed by public_id, is_solved -> TRUE) and also returned as bytes.
 
   PERFORMANCE
-  - Per-yieldstep saving is now an O(1)-Python snapshot of 3 float32 arrays
+  - Per-yieldstep saving is an O(1)-Python snapshot of 3 float32 arrays
     (stage, xmom, ymom). Depth/speed/velocities are derived ONCE at the end,
-    vectorized. (Was: a Python loop over every triangle x 7 quantities per
-    yieldstep -> seconds of GPU-idle time, ~10x more RAM.)
+    vectorized.
   - Elevation/friction are static: captured once, not per timestep.
-  - domain.set_store(False): skips the per-yieldstep .sww write + D2H sync
-    (nobody reads the .sww; the JSON is the product).
-  - Inlet discharge now uses Rate_operator.inflow (GPU-resident: no per-step
-    device<->host gathers; polygon size no longer matters). Same semantics:
-    total inflow = Q m^3/s, Q may be a scalar or a callable Q(t).
-
-  BUG FIXES
-  - friction / initial stage are no longer silently overwritten by leftover
-    debug lines (friction=0.01, stage=elevation).
-  - `region` loop-variable shadowing fixed (props were read from the last
-    meshResolution feature when one existed).
-  - bc_factory defined once; typo entry "tr1ansmissive" removed. Both
-    remaining boundary types are GPU-native, so the fused C RK loop is kept.
-  - Subprocess mode now returns the same thing as in-process mode
-    (gzipped JSON bytes).
+  - domain.set_store(False): skips the per-yieldstep .sww write + D2H sync.
+  - Inlet discharge uses Rate_operator.inflow (GPU-resident).
 
 Env vars:
   ANUGA_GPU_MODE        multiprocessor mode int  (default: 2)
-  ANUGA_ELEVATION       path to the .asc DEM     (default: ./src/mi_terreno.asc)
+  ANUGA_ELEVATION       path to the DEM          (default: ./src/mi_terreno_whole.tif)
   TETIS_REDIS_URL       redis url for progress   (default: redis://redis:6379)
   ANUGA_GPU_SUBPROCESS  "1" -> run simulation out-of-process (recommended in
                         production: a native crash can't kill the RQ worker,
                         and GPU state is fully released between jobs).
+  DB_HOST / DB_NAME / PG_USER / PG_PASSWORD / DB_PORT
+                        Postgres connection (db.py reads these); the worker
+                        needs them to persist the solution.
 """
 
 import pyproj
@@ -126,11 +119,11 @@ class SimulationResult(BaseModel):
 
 # ===========================================================================
 # PART 1 — RQ launcher (runs in the single RQ worker process)
-# ==========================================================tif=================
+# ===========================================================================
 
 
 def run_anuga(
-    payload,
+    job_payload,
     src_epsg=4326,
     dst_epsg=25830,
     output_name="simulation",
@@ -139,14 +132,33 @@ def run_anuga(
     """RQ entrypoint. Runs the GPU simulation, either in-process (default) or
     out-of-process via `tasks.py --gpu-worker` when ANUGA_GPU_SUBPROCESS=1.
 
-    Returns gzipped JSON bytes of a SimulationResult in BOTH modes.
+    The job is enqueued as {"public_id": ..., "payload": {config, features}}.
+    The gzipped SimulationResult is persisted to Postgres on completion and
+    also returned (bytes) for convenience / the out-of-process path.
     """
     from rq import get_current_job
     from events import channel_for, encode
+    import db  # flat import to match the worker's import root (see `events`)
 
     print("WORKER: Received job. Starting GPU simulation...")
     job = get_current_job()
     job_id = job.id if job is not None else "local"
+
+    # ---- Unwrap the enqueue envelope -------------------------------------
+    # New shape: {"public_id": "<uuid>", "payload": {config, features}}
+    # Fallback: a bare {config, features} payload (no envelope).
+    if isinstance(job_payload, dict) and "payload" in job_payload:
+        public_id = job_payload.get("public_id")
+        payload = job_payload["payload"]
+    else:
+        public_id = None
+        payload = job_payload
+
+    if public_id is None:
+        print(
+            "WORKER: WARNING — no public_id in job; solution will NOT be "
+            "persisted to the DB (returning bytes only)."
+        )
 
     use_subprocess = os.getenv("ANUGA_GPU_SUBPROCESS", "0") == "1"
     elevation_file = os.getenv("ANUGA_ELEVATION", "./src/mi_terreno_whole.tif")
@@ -155,17 +167,32 @@ def run_anuga(
 
     print(elevation_file)
 
-    def _notify_complete():
+    def _persist_and_notify(gz_bytes):
+        """Write the gzipped solution to the DB (if we know the instance) and
+        publish the terminal 'complete' event."""
+        if public_id is not None:
+            try:
+                db.save_solution_bytes(public_id, gz_bytes)
+                print(f"WORKER: solution stored for instance {public_id}")
+            except Exception as e:
+                print(f"WORKER: ERROR storing solution: {e}")
+                if job is not None:
+                    job.connection.publish(
+                        channel_for(job.id),
+                        encode(
+                            "error",
+                            {"detail": f"Failed to store solution: {e}"},
+                        ),
+                    )
+                raise
+
         if job is not None:
             job.meta["progress"] = 1.0
             job.meta["status_message"] = "Simulation complete"
             job.save_meta()
             job.connection.publish(
                 channel_for(job.id),
-                encode(
-                    "complete",
-                    {"job_id": job.id, "file": f"/api/simulate/{job.id}/result"},
-                ),
+                encode("complete", {"job_id": job.id, "public_id": public_id}),
             )
 
     if not use_subprocess:
@@ -181,8 +208,8 @@ def run_anuga(
             elevation_file=elevation_file,
             gpu_mode=int(os.getenv("ANUGA_GPU_MODE", "2")),
         )
-        result = _run_gpu_worker(args, payload=payload)
-        _notify_complete()
+        result = _run_gpu_worker(args, payload=payload)  # gzipped bytes
+        _persist_and_notify(result)
         return result
 
     # ---- Out-of-process path ----
@@ -193,6 +220,7 @@ def run_anuga(
 
     proc = None
     try:
+        # Write the UNWRAPPED payload — the subprocess expects {config, features}.
         with open(payload_path, "w") as f:
             json.dump(payload, f)
 
@@ -255,7 +283,8 @@ def run_anuga(
         with open(result_path, "rb") as f:
             result = f.read()  # gzipped JSON bytes, same as in-process
 
-        _notify_complete()
+        # Parent worker (which has DB access) persists; the subprocess does not.
+        _persist_and_notify(result)
         return result
 
     finally:
@@ -427,7 +456,7 @@ def _make_q(q_spec):
 
 
 def _make_rate(q_spec):
-    """Discharge spec -> scalar or callable(t).
+    """Rate spec -> scalar or callable(t).
 
     WARNING: the 'python' form exec()s payload code in this worker — that is
     remote code execution if the API is ever exposed beyond trusted users.
@@ -642,7 +671,6 @@ def _run_gpu_worker(args, payload=None):
 
     print("gziping")
     _publish_progress(args.job_id, 100, "Simulation complete")
-    print(result)
     json_bytes = result.model_dump_json().encode("utf-8")
     gz = gzip.compress(json_bytes)
     size_mb = len(gz) / (1024 * 1024)

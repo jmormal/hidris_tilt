@@ -19,3 +19,5 @@ rq
 pymetis
 tqdm
 pymetis
+psycopg2-binary
+python-multipart

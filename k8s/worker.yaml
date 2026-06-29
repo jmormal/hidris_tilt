@@ -49,6 +49,20 @@ spec:
             # Per-pool value — stays inline, NOT in the shared config.
             - name: QUEUE
               value: "jobs:gpu"
+            - name: PG_USER
+              valueFrom:
+                secretKeyRef:
+                  name: hidris-db-app
+                  key: username
+            - name: PG_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: hidris-db-app
+                  key: password
+            - name: DB_HOST
+              value: "hidris-db-rw"
+            - name: DB_NAME
+              value: "hidris"
           resources:
             limits:
               nvidia.com/gpu: 1
