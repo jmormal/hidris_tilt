@@ -1,0 +1,99 @@
+# k8s/pgadmin.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pgadmin-servers
+data:
+  servers.json: |
+    {
+      "Servers": {
+        "1": {
+          "Name": "hidris",
+          "Group": "Servers",
+          "Host": "hidris-db-rw",
+          "Port": 5432,
+          "MaintenanceDB": "hidris",
+          "Username": "hidris",
+          "PassFile": "/pgpass",
+          "SSLMode": "prefer"
+        }
+      }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pgadmin
+spec:
+  selector:
+    matchLabels:
+      app: pgadmin
+  template:
+    metadata:
+      labels:
+        app: pgadmin
+    spec:
+      containers:
+        - name: pgadmin
+          image: dpage/pgadmin4:latest
+          env:
+            - name: PGADMIN_DEFAULT_EMAIL
+              value: "admin@hidris.com"
+            - name: PGADMIN_DEFAULT_PASSWORD
+              value: "admin"
+            - name: PGADMIN_CONFIG_PROXY_X_HOST_COUNT
+              value: "1"
+            - name: PGADMIN_CONFIG_PROXY_X_PREFIX_COUNT
+              value: "1"
+          ports:
+            - containerPort: 80
+          volumeMounts:
+            - name: servers
+              mountPath: /pgadmin4/servers.json
+              subPath: servers.json
+            - name: pgpass
+              mountPath: /pgpass
+              subPath: pgpass
+          readinessProbe:
+            httpGet:
+              path: /misc/ping
+              port: 80
+            initialDelaySeconds: 15
+            periodSeconds: 10
+      volumes:
+        - name: servers
+          configMap:
+            name: pgadmin-servers
+        - name: pgpass
+          secret:
+            secretName: pgadmin-pgpass
+            defaultMode: 0600
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pgadmin
+spec:
+  selector:
+    app: pgadmin
+  ports:
+    - port: 80
+      targetPort: 80
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: pgadmin
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: pgadmin.127.0.0.1.nip.io
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: pgadmin
+                port:
+                  number: 80

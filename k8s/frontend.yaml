@@ -34,6 +34,10 @@ metadata:
   name: frontend
 spec:
   ingressClassName: traefik
+  tls:
+    - hosts:
+        - frontend.127.0.0.1.nip.io
+      secretName: nip-tls
   rules:
     - host: frontend.127.0.0.1.nip.io
       http:

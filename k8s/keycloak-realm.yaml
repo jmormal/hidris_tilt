@@ -1,0 +1,48 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: keycloak-realm
+data:
+  hidris-realm.json: |
+    {
+      "realm": "hidris",
+      "enabled": true,
+      "clients": [
+        {
+          "clientId": "hidris-frontend",
+          "enabled": true,
+          "publicClient": true,
+          "standardFlowEnabled": true,
+          "redirectUris": [
+            "https://frontend.127.0.0.1.nip.io/*",
+            "http://frontend.127.0.0.1.nip.io/*",
+            "http://localhost:3000/*",
+            "https://api.127.0.0.1.nip.io/docs/oauth2-redirect",
+            "http://localhost:8000/docs/oauth2-redirect"
+          ],
+          "webOrigins": [
+            "https://frontend.127.0.0.1.nip.io",
+            "http://frontend.127.0.0.1.nip.io",
+            "http://localhost:3000",
+            "https://api.127.0.0.1.nip.io",
+            "http://localhost:8000"
+          ],
+          "attributes": {
+            "pkce.code.challenge.method": "S256"
+          }
+        }
+      ],
+      "users": [
+        {
+          "username": "test",
+          "enabled": true,
+          "email": "test@hidris.local",
+          "emailVerified": true,
+          "firstName": "Test",
+          "lastName": "User",
+          "credentials": [
+            { "type": "password", "value": "test", "temporary": false }
+          ]
+        }
+      ]
+    }

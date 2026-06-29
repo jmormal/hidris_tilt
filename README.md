@@ -12,7 +12,9 @@ Three Node.js services running on k3d with Traefik routing — all on port 80, r
 ├── k8s/
 │   ├── frontend.yaml          # Deployment + Service + Ingress
 │   ├── api.yaml
-│   └── auth.yaml
+│   ├── redis.yaml             # We use redis for the management of the queues
+│   ├── keda.yaml              # Keda autoscales the pods according to the jobs
+│   └── mlflow.yaml            # We use mlflow to log the process and results of instances
 └── services/
     ├── frontend/              # serves a UI that calls api + auth
     │   ├── Dockerfile
@@ -24,10 +26,6 @@ Three Node.js services running on k3d with Traefik routing — all on port 80, r
     │   ├── Dockerfile
     │   ├── package.json
     │   └── src/index.js
-    └── auth/                  # validates tokens
-        ├── Dockerfile
-        ├── package.json
-        └── src/index.js
 ```
 
 ## Prerequisites
@@ -46,7 +44,7 @@ brew install k3d tilt kubectl
 tilt up
 ```
 
-Open http://frontend.127.0.0.1.nip.io in your browser.
+Open <http://frontend.127.0.0.1.nip.io> in your browser.
 
 ## URLs
 
@@ -54,45 +52,8 @@ All traffic goes through port 80. Traefik routes by the `Host:` header.
 
 | Service  | External URL                         | Internal (cluster) |
 |----------|--------------------------------------|--------------------|
-| frontend | http://frontend.127.0.0.1.nip.io     | http://frontend:80 |
-| api      | http://api.127.0.0.1.nip.io          | http://api:80      |
-| auth     | http://auth.127.0.0.1.nip.io         | http://auth:80     |
+| frontend | <http://frontend.127.0.0.1.nip.io>     | <http://frontend:80> |
+| api      | <http://api.127.0.0.1.nip.io>          | <http://api:80>      |
 
 > The browser uses nip.io URLs. Services talking to *each other* use the short
 > internal name — traffic stays inside the cluster and never touches Traefik.
-
-## Kubernetes context
-
-k3d creates a context named `k3d-dev` automatically.
-The Tiltfile pins to it — Tilt will refuse to run against any other cluster.
-
-```bash
-kubectl config get-contexts          # list all contexts
-kubectl config use-context k3d-dev   # switch manually
-kubectl config current-context       # check active context
-```
-
-To use a different cluster name, update `allow_k8s_contexts(...)` in the Tiltfile.
-
-## Live reload
-
-Tilt syncs `src/` directly into the running container — no rebuild needed for
-most changes. Node's `--watch` flag (built-in since v18) restarts the process
-automatically when a synced file changes.
-
-A full image rebuild only happens when you change the `Dockerfile` or `package.json`.
-
-## Test tokens
-
-The auth service accepts two hardcoded dev tokens:
-- `dev-token-123`
-- `dev-token-456`
-
-Replace the `VALID_TOKENS` set in `services/auth/src/index.js` with real JWT logic.
-
-## Teardown
-
-```bash
-./teardown.sh
-```
-# hidris_tilt

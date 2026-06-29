@@ -1,0 +1,16 @@
+# k8s/postgres.yaml
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: hidris-db
+spec:
+  instances: 2
+  # k3d uses the 'local-path' storage class by default
+  storage:
+    size: 5Gi
+  bootstrap:
+    initdb:
+      database: hidris
+      owner: hidris
+      # CNPG will automatically generate a Secret named 'hidris-db-app' 
+      # containing the password for this user.

@@ -50,6 +50,36 @@ type: Opaque
 stringData:
 """ + env_to_yaml(secret_vars)))
 
+# ── TLS for *.127.0.0.1.nip.io (mkcert) ───────────────────────────────────────
+# ONE-TIME per machine, OUTSIDE Tilt:
+#     mkcert -install
+# That installs mkcert's local CA into your OS/browser trust store so the
+# wildcard cert below is trusted with no click-through.
+#
+# This local_resource signs the wildcard and (re)creates the nip-tls secret.
+# It's idempotent via dry-run|apply — the exact pattern used for pgadmin-pgpass.
+# Every ingress-backed service depends on this so the secret exists before the
+# Ingress references it on a cold `tilt up`.
+#
+# Note: the wildcard matches single-label subdomains only
+# (frontend.127.0.0.1.nip.io, keycloak.127.0.0.1.nip.io, …) — which is exactly
+# what every host here is.
+local_resource(
+    "nip-tls",
+    cmd="""
+set -e
+if ! command -v mkcert >/dev/null 2>&1; then
+  echo "ERROR: mkcert not found." >&2
+  echo "Install mkcert and run 'mkcert -install' once on this machine, then re-run tilt." >&2
+  exit 1
+fi
+mkcert -cert-file /tmp/nip.pem -key-file /tmp/nip-key.pem "*.127.0.0.1.nip.io" >/dev/null
+kubectl create secret tls nip-tls \
+  --cert=/tmp/nip.pem --key=/tmp/nip-key.pem \
+  --dry-run=client -o yaml | kubectl apply -f -
+""",
+)
+
 # ── Helper: build + deploy one service ────────────────────────────────────────
 def service_js(name, port):
     docker_build(
@@ -68,7 +98,8 @@ def service_js(name, port):
     k8s_yaml("./k8s/" + name + ".yaml")
     k8s_resource(
         name,
-        links=[link("http://" + name + ".127.0.0.1.nip.io", name)],
+        resource_deps=["nip-tls"],
+        links=[link("https://" + name + ".127.0.0.1.nip.io", name)],
     )
 
 # ── Helper: build + deploy one service ────────────────────────────────────────
@@ -76,7 +107,6 @@ def service_python(name, port):
     docker_build(
         name,
         "./services/" + name,
-        entrypoint=["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", str(port), "--reload"],
         live_update=[
             sync("./services/" + name + "/src", "/app/src"),
             run(
@@ -88,7 +118,8 @@ def service_python(name, port):
     k8s_yaml("./k8s/" + name + ".yaml")
     k8s_resource(
         name,
-        links=[link("http://" + name + ".127.0.0.1.nip.io", name)],
+        resource_deps=["nip-tls"],
+        links=[link("https://" + name + ".127.0.0.1.nip.io", name)],
     )
 
 # ── Helper: build a worker image (used by KEDA ScaledJobs) ────────────────────
@@ -103,9 +134,9 @@ def worker_build(image, src, live_pip=True):
     docker_build(image, src)
 
 # ── Helper: deploy a prebuilt off-the-shelf image ─────────────────────────────
-def service_image(name, links=[]):
+def service_image(name, links=[], resource_deps=[]):
     k8s_yaml("./k8s/" + name + ".yaml")
-    k8s_resource(name, links=links)
+    k8s_resource(name, links=links, resource_deps=resource_deps)
 
 # ── Services ──────────────────────────────────────────────────────────────────
 service_js("frontend", 3000)
@@ -127,7 +158,8 @@ k8s_yaml("./k8s/jupyter.yaml")
 k8s_resource(
     workload="jupyter",
     new_name="jupyter",
-    links=[link("http://jupyter.127.0.0.1.nip.io", "jupyter")],
+    resource_deps=["nip-tls"],
+    links=[link("https://jupyter.127.0.0.1.nip.io", "jupyter")],
 )
 
 # ── Workers ───────────────────────────────────────────────────────────────────
@@ -138,9 +170,9 @@ worker_build("worker-cpu", "./services/worker-cpu")
 worker_build("worker-gpu", "./services/worker-gpu", live_pip=False)
 
 # ── Infra (prebuilt images) ───────────────────────────────────────────────────
-service_image("minio", links=[link("http://minio.127.0.0.1.nip.io", "minio console")])
+service_image("minio", links=[link("https://minio.127.0.0.1.nip.io", "minio console")], resource_deps=["nip-tls"])
 service_image("redis")
-service_image("mlflow", links=[link("http://mlflow.127.0.0.1.nip.io", "mlflow")])
+service_image("mlflow", links=[link("https://mlflow.127.0.0.1.nip.io", "mlflow")], resource_deps=["nip-tls"])
 
 # ── KEDA (cluster-wide autoscaler operator) ───────────────────────────────────
 # KEDA is an operator, not a single Deployment — install it via Helm, then
@@ -157,9 +189,6 @@ helm_resource(
 # ScaledJobs: each spawns one worker Job per queued Redis item. Split per type
 # so cpu/gpu can be read, deployed, and disabled independently. Both depend on
 # KEDA (for the CRDs) + redis (the trigger source).
-# ScaledJobs: each spawns one worker Job per queued Redis item. Split per type
-# so cpu/gpu can be read, deployed, and disabled independently. Both depend on
-# KEDA (for the CRDs) + redis (the trigger source).
 k8s_yaml("./k8s/keda-cpu.yaml")
 k8s_resource(
     "worker-cpu", # Target the auto-created resource directly
@@ -170,4 +199,56 @@ k8s_yaml("./k8s/keda-gpu.yaml")
 k8s_resource(
     "worker-gpu", # Target the auto-created resource directly
     resource_deps=["keda", "redis"],
+)
+
+# in Tiltfile, alongside service_image("redis") etc.
+k8s_yaml("./k8s/keycloak-realm.yaml")   # ConfigMap first
+service_image("keycloak", links=[link("https://keycloak.127.0.0.1.nip.io", "keycloak")], resource_deps=["nip-tls"])
+
+
+# ── CloudNativePG (Postgres Operator) ─────────────────────────────────────────
+helm_repo("cnpg-repo", "https://cloudnative-pg.github.io/charts")
+helm_resource(
+    "cnpg",
+    "cnpg-repo/cloudnative-pg",
+    namespace="cnpg-system",
+    flags=["--create-namespace"],
+    resource_deps=["cnpg-repo"],
+)
+
+# ── Postgres Cluster ──────────────────────────────────────────────────────────
+# 1. Load the manifest file
+k8s_yaml("./k8s/postgres.yaml")
+
+# 2. Explicitly compile the Custom Resource into a Tilt resource
+k8s_resource(
+    new_name="hidris-db",
+    objects=["hidris-db:cluster"], # Selector format: [metadata.name]:[kind]
+    resource_deps=["cnpg"],        # Still waits for the operator to be ready
+)
+# ── pgAdmin ───────────────────────────────────────────────────────────────────
+# Deploy pgAdmin, then create its passfile secret from the CNPG-generated
+# password via a local_resource (shell runs on the host, not in Starlark).
+# Ordering: hidris-db (secret exists) -> pgadmin-pgpass -> pgadmin pod.
+
+k8s_yaml("./k8s/pgadmin.yaml")
+
+# Build the passfile secret from the CNPG app secret. Idempotent via
+# dry-run|apply so re-runs don't fail with "already exists".
+local_resource(
+    "pgadmin-pgpass",
+    cmd="""
+PW=$(kubectl get secret hidris-db-app -o jsonpath='{.data.password}' | base64 -d)
+kubectl create secret generic pgadmin-pgpass \
+  --from-literal=pgpass="hidris-db-rw:5432:hidris:hidris:${PW}" \
+  --dry-run=client -o yaml | kubectl apply -f -
+""",
+    resource_deps=["hidris-db"],
+)
+
+# pgadmin pod waits for the passfile secret it mounts.
+k8s_resource(
+    "pgadmin",
+    resource_deps=["pgadmin-pgpass", "nip-tls"],
+    links=[link("https://pgadmin.127.0.0.1.nip.io", "pgadmin")],
 )

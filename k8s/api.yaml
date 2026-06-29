@@ -11,6 +11,33 @@ spec:
       labels:
         app: api
     spec:
+# ─── 1. THIS IS THE NEW INIT CONTAINER BLOCK ──────────────────────────
+      initContainers:
+        - name: run-migrations
+          image: api # Reuses your API image built by Tilt
+          envFrom:
+            - configMapRef:
+                name: app-config
+          env:
+            - name: PG_USER
+              valueFrom:
+                secretKeyRef:
+                  name: hidris-db-app
+                  key: username
+            - name: PG_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: hidris-db-app
+                  key: password
+            - name: DB_HOST
+              value: "hidris-db-rw"
+            - name: DB_NAME
+              value: "hidris"
+          # Run your migration tool or script here. 
+          # Example for Alembic:
+          # command: ["alembic", "upgrade", "head"]
+          # Example for a custom python script:
+          command: ["python", "src/db.py"]
       containers:
         - name: api
           image: api
@@ -25,6 +52,22 @@ spec:
               port: 8080
             initialDelaySeconds: 5
             periodSeconds: 10
+          env:
+            # Pull the auto-generated CNPG credentials
+            - name: PG_USER
+              valueFrom:
+                secretKeyRef:
+                  name: hidris-db-app
+                  key: username
+            - name: PG_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: hidris-db-app
+                  key: password
+            - name: DB_HOST
+              value: "hidris-db-rw" # The Read/Write service
+            - name: DB_NAME
+              value: "hidris"
 ---
 apiVersion: v1
 kind: Service
@@ -43,6 +86,10 @@ metadata:
   name: api
 spec:
   ingressClassName: traefik
+  tls:
+    - hosts:
+        - api.127.0.0.1.nip.io
+      secretName: nip-tls
   rules:
     - host: api.127.0.0.1.nip.io
       http:
