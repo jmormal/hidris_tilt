@@ -1,8 +1,10 @@
 import os
 import json
 import gzip
+import io
 from contextlib import contextmanager
 
+import numpy as np
 import psycopg2
 from psycopg2.extras import RealDictCursor, Json
 from psycopg2.pool import ThreadedConnectionPool
@@ -21,10 +23,17 @@ _pool = ThreadedConnectionPool(
 @contextmanager
 def get_conn():
     conn = _pool.getconn()
+    broken = False
     try:
         yield conn
+    except psycopg2.OperationalError:
+        # Connection itself is dead — discard it instead of returning it to
+        # the pool, otherwise every subsequent request keeps drawing the same
+        # broken connection and fails identically.
+        broken = True
+        raise
     finally:
-        _pool.putconn(conn)
+        _pool.putconn(conn, close=broken)
 
 
 def init_db():
@@ -205,6 +214,45 @@ def save_solution_bytes(public_id: str, gz: bytes):
                 (psycopg2.Binary(gz), public_id),
             )
         conn.commit()
+
+
+def get_storm_cube(public_id: str):
+    """
+    Read-only, worker-side. Returns (cube ndarray (T,H,W) float32, meta dict)
+    or (None, None). Mirrors services/api/src/db.py's function of the same
+    name — the cube lives in a Postgres large object (data_grid_oid), not an
+    inline bytea column, so a big multi-frame storm doesn't blow past
+    Postgres's 1GB single-value ceiling.
+    """
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT timestep_s, n_frames, grid_rows, grid_cols,
+                       cell_size_m, units, nodata, data_grid_oid, data_grid
+                FROM storms
+                WHERE public_id = %s;
+            """,
+                (public_id,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return None, None
+            oid = row.pop("data_grid_oid")
+            legacy_blob = row.pop("data_grid", None)
+            if oid is None:
+                if legacy_blob is None:
+                    return None, None
+                raw = bytes(legacy_blob)
+            else:
+                lo = conn.lobject(oid, "rb")
+                try:
+                    raw = lo.read()
+                finally:
+                    lo.close()
+            buf = io.BytesIO(gzip.decompress(raw))
+            cube = np.load(buf)
+            return cube, row
 
 
 if __name__ == "__main__":

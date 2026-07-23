@@ -35,6 +35,7 @@ import rasterio
 import argparse
 import gzip
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -51,9 +52,12 @@ from anuga.geometry.polygon_function import Polygon_function
 # ===========================================================================
 # Data model (unchanged wire format)
 # ===========================================================================
-PRECISION_SAVE = 1  # decimals kept in the JSON. NOTE: depths < 0.05 m round
-# to 0.0 — bump to 2 if small depths matter (gzip makes
-# the size cost small).
+PRECISION_SAVE = 4  # decimals kept in the JSON (0.1 mm). Was 1 (0.05 m
+# rounding) — too coarse for storm rainfall, which is
+# legitimately mm-scale over an hour; gzip keeps the size
+# cost of the extra digits small. The wet/dry filter itself
+# runs on unrounded depth (see _finalize_result), so this
+# constant only controls output precision, not detection.
 
 
 def clip_dem_to_asc(
@@ -318,6 +322,42 @@ def _close_ring_removed(coords):
     return coords
 
 
+# Matches utils/stormPlacement.ts's METRES_PER_DEG_LAT — halfW/halfH were
+# built on the frontend with this same approximation, so converting them
+# back to metres here (rather than re-deriving from the storm's own
+# cell_size_m) reproduces exactly the footprint the user saw/dragged.
+_METRES_PER_DEG_LAT = 111_320
+
+
+def _storm_placement_to_domain(placement, xllcorner, yllcorner, src_epsg=4326, dst_epsg=25830):
+    """
+    Reproject a storm's placement — {centerLng, centerLat, halfW, halfH
+    (degrees), rotationDeg} as saved by the frontend — into the domain's
+    LOCAL frame (metres, relative to xllcorner/yllcorner) that
+    storm_sampler.build_storm_rate expects: {centerX, centerY, halfW, halfH
+    (metres), rotationDeg}. Subtracting the corner here — rather than handing
+    back absolute EPSG coordinates — matches domain.centroid_coordinates,
+    the frame anuga.Rate_operator itself samples a spatial rate(x,y,t) in.
+    """
+    center_lng = float(placement["centerLng"])
+    center_lat = float(placement["centerLat"])
+
+    transformer = pyproj.Transformer.from_crs(
+        f"EPSG:{src_epsg}", f"EPSG:{dst_epsg}", always_xy=True
+    )
+    abs_x, abs_y = transformer.transform(center_lng, center_lat)
+
+    m_per_deg_lng = _METRES_PER_DEG_LAT * math.cos(math.radians(center_lat))
+
+    return {
+        "centerX": abs_x - xllcorner,
+        "centerY": abs_y - yllcorner,
+        "halfW": float(placement["halfW"]) * m_per_deg_lng,
+        "halfH": float(placement["halfH"]) * _METRES_PER_DEG_LAT,
+        "rotationDeg": float(placement.get("rotationDeg", 0.0)),
+    }
+
+
 def _build_vertices(domain, dst_epsg, src_epsg):
     """Reproject mesh nodes back to lat/lon once."""
     nodes = domain.mesh.nodes
@@ -369,6 +409,15 @@ def _finalize_result(
         xvel = np.where(depth > 1e-6, xmom / depth, 0.0)
         yvel = np.where(depth > 1e-6, ymom / depth, 0.0)
 
+    # Wet filter on the UNROUNDED depth. This must run before prep()/rounding:
+    # PRECISION_SAVE rounds to whole 10^-PRECISION_SAVE units, so with the old
+    # PRECISION_SAVE=1 (0.1 m bins) any real depth under 0.05 m — e.g. a
+    # storm's rainfall over a short duration, easily sub-centimetre — rounded
+    # to 0.0 and could never pass `> depth_threshold`, silently discarding
+    # real (if small) wet triangles regardless of how low depth_threshold was.
+    wet = depth.max(axis=0) > depth_threshold  # (N,)
+    wet_idx = np.flatnonzero(wet)
+
     # float64 BEFORE rounding so 0.1 serializes as 0.1 (a rounded float32
     # converted later would print as 0.10000000149...).
     def prep(a):
@@ -376,11 +425,6 @@ def _finalize_result(
 
     stage, depth, xmom, ymom = prep(stage), prep(depth), prep(xmom), prep(ymom)
     speed, xvel, yvel = prep(speed), prep(xvel), prep(yvel)
-
-    # Wet filter on the ROUNDED depths (matches the original behaviour:
-    # with PRECISION_SAVE=1 the effective threshold is one rounding unit).
-    wet = depth.max(axis=0) > depth_threshold  # (N,)
-    wet_idx = np.flatnonzero(wet)
 
     tri_wet = tri_indices[wet_idx]  # (W, 3)
     used = np.unique(tri_wet)  # sorted old vertex ids
@@ -623,6 +667,39 @@ def _run_gpu_worker(args, payload=None):
         q = _make_rate(inlet["properties"]["rate"])
         inlet_rel = [[x - xllcorner, y - yllcorner] for x, y in inlet_abs]
         anuga.Rate_operator(domain, rate=q, polygon=inlet_rel)
+
+    # ---- Historical storms (rainfall raster, spatially + temporally varying) ----
+    # Placement is saved in WGS84 degrees (the frontend gizmo); reproject it
+    # into the domain's absolute EPSG:{dst_epsg} frame before sampling. No
+    # `polygon=` kwarg on Rate_operator — the rate function already returns 0
+    # for centroids outside the placed footprint (see storm_sampler.py), so
+    # it can safely span the whole domain instead of being clipped to one.
+    storms = features.get("storm", [])
+    if storms:
+        import db  # flat import to match the worker's import root (see `events`)
+        import storm_sampler
+
+        for storm_feat in storms:
+            storm_ref = storm_feat["storm_ref"]
+            cube, storm_meta = db.get_storm_cube(storm_ref)
+            if cube is None:
+                print(f"[tasks:gpu] WARNING: storm {storm_ref} not found, skipping")
+                continue
+            domain_placement = _storm_placement_to_domain(
+                storm_feat["placement"], xllcorner, yllcorner,
+                src_epsg=src_epsg, dst_epsg=dst_epsg,
+            )
+            print(
+                f"[tasks:gpu] storm {storm_ref}: meta={storm_meta} "
+                f"raw_placement={storm_feat['placement']} "
+                f"domain_placement={domain_placement}"
+            )
+            scale = float(storm_feat.get("scale", 1.0))
+            rate_fn = storm_sampler.build_storm_rate(
+                domain, cube, storm_meta, domain_placement, scale=scale
+            )
+            anuga.Rate_operator(domain, rate=rate_fn)
+
     B = []
     print(features)
     B = []
