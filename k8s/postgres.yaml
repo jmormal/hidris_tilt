@@ -5,12 +5,26 @@ metadata:
   name: hidris-db
 spec:
   instances: 2
+  # PostGIS + raster need an image that ships the extensions and GDAL.
+  # Must match the existing cluster's major version (18) — CNPG forbids
+  # major downgrades. The PostGIS images use a full tag; this is the
+  # rolling "latest for PG18 / PostGIS 3.x" form.
+  imageName: ghcr.io/cloudnative-pg/postgis:18-3.6-system-trixie
   # k3d uses the 'local-path' storage class by default
   storage:
     size: 5Gi
+  postgresql:
+    parameters:
+      # Allow ST_AsPNG / ST_ColorMap to use GDAL PNG driver inside SQL.
+      postgis.gdal_enabled_drivers: "ENABLE_ALL"
+      postgis.enable_outdb_rasters: "true"
+      # raster tile work is binary-heavy; give queries room
+      work_mem: "128MB"
+      shared_buffers: "256MB"
   bootstrap:
     initdb:
       database: hidris
       owner: hidris
-      # CNPG will automatically generate a Secret named 'hidris-db-app' 
-      # containing the password for this user.
+      postInitApplicationSQL:
+        - CREATE EXTENSION IF NOT EXISTS postgis;
+        - CREATE EXTENSION IF NOT EXISTS postgis_raster;

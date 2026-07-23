@@ -1,0 +1,111 @@
+# k8s/martin.yaml
+# Martin tile server — auto-publishes the storm_tile / storm_accum6h functions.
+#
+# CNPG creates a secret named "<cluster>-app" with the app user's
+# credentials and a ready-to-use connection URI under the key "uri".
+# We feed that straight into Martin's DATABASE_URL.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: martin-config
+data:
+  config.yaml: |
+    # Listen address
+    listen_addresses: "0.0.0.0:3000"
+    # Connection pool
+    # Auto-discover function sources. Martin finds functions whose first
+    # three args are (z,x,y); remaining args become query parameters.
+    postgres:
+      # connection_string references DATABASE_URL, injected by the Deployment
+      # from the CNPG hidris-db-app secret. With a config file loaded, Martin
+      # only reads DATABASE_URL because it is referenced here.
+      connection_string: ${DATABASE_URL}
+      functions:
+        storm_tile:
+          schema: public
+          function: storm_tile
+        storm_accum6h:
+          schema: public
+          function: storm_accum6h
+    # CORS so the browser (deck.gl) can fetch tiles cross-origin.
+    # Tighten the origin in production.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: martin
+  labels:
+    app: martin
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: martin
+  template:
+    metadata:
+      labels:
+        app: martin
+    spec:
+      containers:
+        - name: martin
+          image: ghcr.io/maplibre/martin:latest
+          args: []
+          ports:
+            - containerPort: 3000
+          env:
+            # drop the ConfigMap mount and the --config arg; just:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hidris-db-app
+                  key: uri
+            - name: RUST_LOG
+              value: "martin=debug,martin_core=debug"
+            # CNPG app secret -> connection URI
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hidris-db-app
+                  key: uri
+          volumeMounts:
+            - name: config
+              mountPath: /config
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "1"
+              memory: "512Mi"
+      volumes:
+        - name: config
+          configMap:
+            name: martin-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: martin
+  labels:
+    app: martin
+spec:
+  selector:
+    app: martin
+  ports:
+    - name: http
+      port: 80
+      targetPort: 3000
+  type: ClusterIP

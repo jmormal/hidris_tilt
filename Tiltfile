@@ -109,6 +109,7 @@ def service_python(name, port):
         "./services/" + name,
         live_update=[
             sync("./services/" + name + "/src", "/app/src"),
+            sync("./services/" + name + "/storms", "/app/storms"),
             run(
                 "cd /app && pip install -r requirements.txt",
                 trigger=["./services/" + name + "/requirements.txt"],
@@ -220,6 +221,8 @@ helm_resource(
 # 1. Load the manifest file
 k8s_yaml("./k8s/postgres.yaml")
 
+k8s_yaml("./k8s/postgres-keycloak.yaml")
+k8s_yaml("./k8s/martin.yaml")
 # 2. Explicitly compile the Custom Resource into a Tilt resource
 k8s_resource(
     new_name="hidris-db",

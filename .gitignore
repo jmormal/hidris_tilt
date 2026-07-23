@@ -1,4 +1,5 @@
 services/jupyter/
+*.tif
 *.asc
 /services/worker-gpu/mesh/MDT_malla_5m_etrs89h30
 /services/worker-gpu/mesh/MDT_malla_5m_etrs89h30.ers

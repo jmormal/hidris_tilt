@@ -28,6 +28,22 @@ spec:
               value: "false"
             - name: KC_HTTP_ENABLED
               value: "true"
+                          # --- CONFIGURACIÓN DE LA BASE DE DATOS POSTGRES ---
+            - name: KC_DB
+              value: "postgres"
+            - name: KC_DB_URL
+              # "hidris-db-rw" es el servicio de escritura de CNPG
+              value: "jdbc:postgresql://keycloak-db-rw.default.svc.cluster.local:5432/keycloak"
+            - name: KC_DB_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: keycloak-db-app
+                  key: username
+            - name: KC_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: keycloak-db-app
+                  key: password
           ports:
             - containerPort: 8080
           readinessProbe:
