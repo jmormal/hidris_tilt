@@ -104,9 +104,15 @@ class Vertex(BaseModel):
 
 class Triangle(BaseModel):
     vertices: tuple[int, int, int]
-    # elevation: float
+    # Static ground height (m) under this triangle, from the DEM the solve
+    # actually ran on. One float per triangle — cheap next to a per-frame
+    # series, and it is what lets the 3D view sit the water surface on the
+    # same ground ANUGA used (water z = elevation + depth[frame]). Deriving
+    # it from an external DEM instead would disagree by metres and leave the
+    # flood visibly floating or buried.
+    elevation: float
     # friction: float
-    # stage: list[float]
+    # stage: list[float]   # derivable: elevation + depth
     depth: list[float]
     # xmomentum: list[float]
     # ymomentum: list[float]
@@ -451,7 +457,7 @@ def _finalize_result(
                     int(remapped[w, 1]),
                     int(remapped[w, 2]),
                 ),
-                # elevation=float(elev_r[i]),
+                elevation=float(elev_r[i]),
                 # friction=float(fric_r[i]),
                 # stage=stage_t[i].tolist(),
                 depth=depth_t[i].tolist(),

@@ -216,6 +216,33 @@ def save_solution_bytes(public_id: str, gz: bytes):
         conn.commit()
 
 
+# `data_grid` (the old inline bytea cube) only exists on tables created before
+# the large-object switch. init_storms() does NOT create it on a fresh
+# database — it only relaxes its NOT NULL when a legacy table already has it —
+# so naming it in a SELECT is an UndefinedColumn error on any new deployment.
+# Probe once per process and cache.
+_HAS_LEGACY_DATA_GRID = None
+
+
+def _has_legacy_data_grid(cur) -> bool:
+    global _HAS_LEGACY_DATA_GRID
+    if _HAS_LEGACY_DATA_GRID is None:
+        cur.execute(
+            """
+            SELECT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'storms' AND column_name = 'data_grid'
+            ) AS present;
+            """
+        )
+        row = cur.fetchone()
+        _HAS_LEGACY_DATA_GRID = bool(
+            row["present"] if isinstance(row, dict) else row[0]
+        )
+    return _HAS_LEGACY_DATA_GRID
+
+
 def get_storm_cube(public_id: str):
     """
     Read-only, worker-side. Returns (cube ndarray (T,H,W) float32, meta dict)
@@ -226,13 +253,14 @@ def get_storm_cube(public_id: str):
     """
     with get_conn() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cols = (
+                "timestep_s, n_frames, grid_rows, grid_cols, "
+                "cell_size_m, units, nodata, data_grid_oid"
+            )
+            if _has_legacy_data_grid(cur):
+                cols += ", data_grid"
             cur.execute(
-                """
-                SELECT timestep_s, n_frames, grid_rows, grid_cols,
-                       cell_size_m, units, nodata, data_grid_oid, data_grid
-                FROM storms
-                WHERE public_id = %s;
-            """,
+                f"SELECT {cols} FROM storms WHERE public_id = %s;",
                 (public_id,),
             )
             row = cur.fetchone()
