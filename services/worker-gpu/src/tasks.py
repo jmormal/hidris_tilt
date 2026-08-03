@@ -4,8 +4,8 @@ tasks.py — RQ task + GPU-accelerated ANUGA simulation in ONE file.
 Job envelope (new):
   The RQ job arrives as {"public_id": "<uuid>", "payload": {config, features}}.
   run_anuga unwraps it; a bare {config, features} payload still works as a
-  fallback. On completion the gzipped SimulationResult is written to Postgres
-  (keyed by public_id, is_solved -> TRUE) and also returned as bytes.
+  fallback. On completion the gzipped binary result container is written to
+  Postgres (keyed by public_id, is_solved -> TRUE) and also returned as bytes.
 
   PERFORMANCE
   - Per-yieldstep saving is an O(1)-Python snapshot of 3 float32 arrays
@@ -38,6 +38,7 @@ import json
 import math
 import os
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -45,19 +46,17 @@ import tempfile
 import numpy as np
 import geopandas as gpd
 from shapely.geometry import Polygon
-from pydantic import BaseModel
 
 from anuga.geometry.polygon_function import Polygon_function
 
 # ===========================================================================
-# Data model (unchanged wire format)
+# Result wire format
 # ===========================================================================
-PRECISION_SAVE = 4  # decimals kept in the JSON (0.1 mm). Was 1 (0.05 m
-# rounding) — too coarse for storm rainfall, which is
-# legitimately mm-scale over an hour; gzip keeps the size
-# cost of the extra digits small. The wet/dry filter itself
-# runs on unrounded depth (see _finalize_result), so this
-# constant only controls output precision, not detection.
+# The result is a binary container, not JSON — see _encode_result_binary for
+# why. There is no decimal-rounding constant any more: values ship as float32,
+# which is finer than any depth a solver meaningfully resolves and removes the
+# old trap where coarse rounding could zero sub-centimetre depths before the
+# wet/dry filter ever saw them.
 
 
 def clip_dem_to_asc(
@@ -97,34 +96,19 @@ def clip_dem_to_asc(
     return out_path
 
 
-class Vertex(BaseModel):
-    lat: float
-    lon: float
-
-
-class Triangle(BaseModel):
-    vertices: tuple[int, int, int]
-    # Static ground height (m) under this triangle, from the DEM the solve
-    # actually ran on. One float per triangle — cheap next to a per-frame
-    # series, and it is what lets the 3D view sit the water surface on the
-    # same ground ANUGA used (water z = elevation + depth[frame]). Deriving
-    # it from an external DEM instead would disagree by metres and leave the
-    # flood visibly floating or buried.
-    elevation: float
-    # friction: float
-    # stage: list[float]   # derivable: elevation + depth
-    depth: list[float]
-    # xmomentum: list[float]
-    # ymomentum: list[float]
-    speed: list[float]
-    # xvelocity: list[float]
-    # yvelocity: list[float]
-
-
-class SimulationResult(BaseModel):
-    times: list[float]
-    vertices: list[Vertex]
-    triangles: list[Triangle]
+# The old Vertex / Triangle / SimulationResult pydantic models are gone: the
+# result is emitted as typed binary blocks (see _encode_result_binary), so
+# nothing is ever validated or serialised per triangle. Blocks written:
+#
+#   vertexLonLat  f8[nVertices * 2]        lon, lat interleaved
+#   triIndices    i4[nTriangles * 3]       vertex ids into vertexLonLat
+#   elevation     f4[nTriangles]           ground height (m) under each triangle
+#   depth         f4[nTriangles * nFrames] indexed [tri * nFrames + frame]
+#   speed         f4[nTriangles * nFrames] same layout
+#
+# `elevation` is the DEM the solve actually ran on, which is what lets the 3D
+# view sit the water surface on the same ground ANUGA used
+# (water z = elevation + depth[frame]).
 
 
 # ===========================================================================
@@ -143,8 +127,8 @@ def run_anuga(
     out-of-process via `tasks.py --gpu-worker` when ANUGA_GPU_SUBPROCESS=1.
 
     The job is enqueued as {"public_id": ..., "payload": {config, features}}.
-    The gzipped SimulationResult is persisted to Postgres on completion and
-    also returned (bytes) for convenience / the out-of-process path.
+    The gzipped binary result container is persisted to Postgres on completion
+    and also returned (bytes) for convenience / the out-of-process path.
     """
     from rq import get_current_job
     from events import channel_for, encode
@@ -374,7 +358,11 @@ def _build_vertices(domain, dst_epsg, src_epsg):
         geometry=gpd.points_from_xy(abs_nodes[:, 0], abs_nodes[:, 1]),
         crs=f"EPSG:{dst_epsg}",
     ).to_crs(f"EPSG:{src_epsg}")
-    return [Vertex(lat=float(pt.y), lon=float(pt.x)) for pt in gdf.geometry]
+    # (N, 2) float64 [lon, lat] — kept as an array, not objects, so the wet
+    # subset can be fancy-indexed and written straight into a binary block.
+    return np.column_stack(
+        [gdf.geometry.x.to_numpy(), gdf.geometry.y.to_numpy()]
+    ).astype(np.float64)
 
 
 def _snapshot(snapshots, domain, t):
@@ -404,8 +392,9 @@ def _finalize_result(
     dst_epsg,
     depth_threshold=1e-5,
 ):
-    """Derive all quantities vectorized, filter dry triangles, build the
-    SimulationResult ONCE. Only wet triangles ever become Python objects."""
+    """Derive all quantities vectorized, filter dry triangles, and pack the
+    result as one binary blob (see _encode_result_binary). Nothing here ever
+    becomes a per-triangle Python object."""
     times = [s[0] for s in snapshots]
     stage = np.stack([s[1] for s in snapshots])  # (T, N) float32
     xmom = np.stack([s[2] for s in snapshots])
@@ -417,59 +406,93 @@ def _finalize_result(
         xvel = np.where(depth > 1e-6, xmom / depth, 0.0)
         yvel = np.where(depth > 1e-6, ymom / depth, 0.0)
 
-    # Wet filter on the UNROUNDED depth. This must run before prep()/rounding:
-    # PRECISION_SAVE rounds to whole 10^-PRECISION_SAVE units, so with the old
-    # PRECISION_SAVE=1 (0.1 m bins) any real depth under 0.05 m — e.g. a
-    # storm's rainfall over a short duration, easily sub-centimetre — rounded
-    # to 0.0 and could never pass `> depth_threshold`, silently discarding
-    # real (if small) wet triangles regardless of how low depth_threshold was.
+    # Wet filter on the raw depth — no rounding happens anywhere now, so the
+    # subtlety that used to live here (coarse rounding silently zeroing
+    # sub-centimetre storm depths before the threshold could see them) is gone:
+    # values go to the wire as float32, which resolves far below any depth a
+    # solver produces.
     wet = depth.max(axis=0) > depth_threshold  # (N,)
     wet_idx = np.flatnonzero(wet)
-
-    # float64 BEFORE rounding so 0.1 serializes as 0.1 (a rounded float32
-    # converted later would print as 0.10000000149...).
-    def prep(a):
-        return np.round(a.astype(np.float64), PRECISION_SAVE)
-
-    stage, depth, xmom, ymom = prep(stage), prep(depth), prep(xmom), prep(ymom)
-    speed, xvel, yvel = prep(speed), prep(xvel), prep(yvel)
 
     tri_wet = tri_indices[wet_idx]  # (W, 3)
     used = np.unique(tri_wet)  # sorted old vertex ids
     remapped = np.searchsorted(used, tri_wet)  # (W, 3) new ids
 
-    new_vertices = [vertices[int(i)] for i in used]
+    # vertices is (N, 2) float64 [lon, lat] — fancy-index straight to the
+    # subset the wet triangles actually reference.
+    new_vertices = vertices[used]
 
-    elev_r = np.round(elev.astype(np.float64), PRECISION_SAVE)
-    fric_r = np.round(friction.astype(np.float64), PRECISION_SAVE)
+    # Transpose to (W, T) so each triangle's series is one contiguous row,
+    # which is the layout the frontend indexes as [tri * nFrames + frame].
+    depth_w = depth[:, wet_idx].T
+    speed_w = speed[:, wet_idx].T
 
-    # Transpose to (N, T) so each triangle's series is one contiguous row.
-    stage_t, depth_t = stage.T, depth.T
-    xmom_t, ymom_t = xmom.T, ymom.T
-    speed_t, xvel_t, yvel_t = speed.T, xvel.T, yvel.T
+    return _encode_result_binary(
+        times=times,
+        vertex_lonlat=new_vertices,
+        tri_indices=remapped,
+        elevation=elev[wet_idx],
+        depth=depth_w,
+        speed=speed_w,
+    )
 
-    triangles = []
-    for w, i in enumerate(wet_idx):
-        triangles.append(
-            Triangle(
-                vertices=(
-                    int(remapped[w, 0]),
-                    int(remapped[w, 1]),
-                    int(remapped[w, 2]),
-                ),
-                elevation=float(elev_r[i]),
-                # friction=float(fric_r[i]),
-                # stage=stage_t[i].tolist(),
-                depth=depth_t[i].tolist(),
-                # xmomentum=xmom_t[i].tolist(),
-                # ymomentum=ymom_t[i].tolist(),
-                speed=speed_t[i].tolist(),
-                # xvelocity=xvel_t[i].tolist(),
-                # yvelocity=yvel_t[i].tolist(),
-            )
-        )
 
-    return SimulationResult(times=times, vertices=new_vertices, triangles=triangles)
+# Magic + version for the binary result container. Bump the suffix if the
+# block layout ever changes incompatibly; the frontend checks it.
+RESULT_MAGIC = b"HFR1"
+
+_DTYPES = {"f8": np.float64, "f4": np.float32, "i4": np.int32}
+
+
+def _encode_result_binary(times, vertex_lonlat, tri_indices, elevation, depth, speed):
+    """
+    Pack the solution as: magic | header length | JSON header | typed blocks.
+
+    Why not JSON any more: a JSON result has to be materialised in the browser
+    as ONE JavaScript string before JSON.parse can run, and V8 caps a single
+    string near 512MB regardless of how much heap the process was given. Large
+    runs sailed past that and surfaced as "Unexpected end of JSON input".
+    Typed blocks are read straight into TypedArrays — no intermediate string,
+    no millions of per-triangle JS objects, and decoding is a memcpy rather
+    than a parse.
+
+    The header stays JSON because it is tiny and self-describing; only the bulk
+    numeric arrays go binary.
+    """
+    blocks = {}
+    payload = bytearray()
+
+    def add(name, arr, dtype):
+        a = np.ascontiguousarray(arr, dtype=_DTYPES[dtype]).reshape(-1)
+        # Pad so every block starts 8-byte aligned. TypedArray views over an
+        # ArrayBuffer must be aligned to their element size or the constructor
+        # throws, and f8 needs 8.
+        payload.extend(b"\0" * ((-len(payload)) % 8))
+        blocks[name] = {"dtype": dtype, "offset": len(payload), "length": int(a.size)}
+        payload.extend(a.tobytes())
+
+    add("vertexLonLat", vertex_lonlat, "f8")  # f8: ~1e-7 deg matters at metre scale
+    add("triIndices", tri_indices, "i4")
+    add("elevation", elevation, "f4")
+    add("depth", depth, "f4")
+    add("speed", speed, "f4")
+
+    header = {
+        "version": 1,
+        "nVertices": int(np.asarray(vertex_lonlat).shape[0]),
+        "nTriangles": int(np.asarray(tri_indices).shape[0]),
+        "nFrames": len(times),
+        "times": [float(t) for t in times],
+        "blocks": blocks,
+    }
+    head = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    # Pad the header so the block section itself starts 8-byte aligned
+    # (4 magic + 4 length + header). Trailing spaces are legal JSON whitespace.
+    head += b" " * ((-(8 + len(head))) % 8)
+
+    return b"".join(
+        [RESULT_MAGIC, struct.pack("<I", len(head)), head, bytes(payload)]
+    )
 
 
 def _publish_progress(job_id, pct, msg):
@@ -530,7 +553,7 @@ def _make_rate(q_spec):
 
 def _run_gpu_worker(args, payload=None):
     """Single-process GPU simulation. Returns gzipped JSON bytes of a
-    SimulationResult. If args.result is set, also writes those bytes there."""
+    binary result container. If args.result is set, also writes those bytes there."""
     import anuga
 
     src_epsg, dst_epsg = args.src_epsg, args.dst_epsg
@@ -764,10 +787,13 @@ def _run_gpu_worker(args, payload=None):
 
     print("gziping")
     _publish_progress(args.job_id, 100, "Simulation complete")
-    json_bytes = result.model_dump_json().encode("utf-8")
-    gz = gzip.compress(json_bytes)
+    # `result` is already the packed binary container.
+    gz = gzip.compress(result)
     size_mb = len(gz) / (1024 * 1024)
-    print(f"Compressed payload size: {len(gz)} bytes ({size_mb:.2f} MB)")
+    print(
+        f"Compressed payload size: {len(gz)} bytes ({size_mb:.2f} MB) "
+        f"from {len(result) / (1024 * 1024):.2f} MB raw"
+    )
 
     if args.result is not None:
         with open(args.result, "wb") as f:
