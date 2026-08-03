@@ -336,7 +336,7 @@ def _storm_placement_to_domain(
     Reproject a storm's placement — {centerLng, centerLat, halfW, halfH
     (degrees), rotationDeg} as saved by the frontend — into the domain's
     LOCAL frame (metres, relative to xllcorner/yllcorner) that
-    storm_sampler.build_storm_rate expects: {centerX, centerY, halfW, halfH
+    storm_sampler.build_storm_driver expects: {centerX, centerY, halfW, halfH
     (metres), rotationDeg}. Subtracting the corner here — rather than handing
     back absolute EPSG coordinates — matches domain.centroid_coordinates,
     the frame anuga.Rate_operator itself samples a spatial rate(x,y,t) in.
@@ -701,10 +701,14 @@ def _run_gpu_worker(args, payload=None):
                 f"domain_placement={domain_placement}"
             )
             scale = float(storm_feat.get("scale", 1.0))
-            rate_fn = storm_sampler.build_storm_rate(
+            driver = storm_sampler.build_storm_driver(
                 domain, cube, storm_meta, domain_placement, scale=scale
             )
-            anuga.Rate_operator(domain, rate=rate_fn)
+            # StormRateOperator (not a bare Rate_operator with a rate(x,y,t)
+            # callable) — a callable spatial rate is not GPU-offloadable and
+            # would force a GPU<->CPU sync of every quantity on every RK2
+            # stage. See storm_sampler.py's module docstring.
+            storm_sampler.StormRateOperator(domain, driver)
 
     B = []
     print(features)
