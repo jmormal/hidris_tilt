@@ -13,6 +13,16 @@ spec:
   # k3d uses the 'local-path' storage class by default
   storage:
     size: 5Gi
+  managed:
+    services:
+      additional:
+        - selectorType: rw
+          serviceTemplate:
+            metadata:
+              name: hidris-db-ts
+              annotations:
+                tailscale.com/expose: "true"
+                tailscale.com/hostname: "hidris-db"
   postgresql:
     parameters:
       # Allow ST_AsPNG / ST_ColorMap to use GDAL PNG driver inside SQL.

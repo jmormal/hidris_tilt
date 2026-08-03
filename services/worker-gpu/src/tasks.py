@@ -329,7 +329,9 @@ def _close_ring_removed(coords):
 _METRES_PER_DEG_LAT = 111_320
 
 
-def _storm_placement_to_domain(placement, xllcorner, yllcorner, src_epsg=4326, dst_epsg=25830):
+def _storm_placement_to_domain(
+    placement, xllcorner, yllcorner, src_epsg=4326, dst_epsg=25830
+):
     """
     Reproject a storm's placement — {centerLng, centerLat, halfW, halfH
     (degrees), rotationDeg} as saved by the frontend — into the domain's
@@ -471,7 +473,7 @@ def _publish_progress(job_id, pct, msg):
         from redis import Redis
         from events import channel_for, encode
 
-        url = os.getenv("TETIS_REDIS_URL", "redis://redis:6379")
+        url = os.getenv("REDIS_URL", "redis://redis:6379")
         Redis.from_url(url).publish(
             channel_for(job_id),
             encode("progress", {"progress": pct, "status_message": msg}),
@@ -676,7 +678,8 @@ def _run_gpu_worker(args, payload=None):
     # it can safely span the whole domain instead of being clipped to one.
     storms = features.get("storm", [])
     if storms:
-        import db  # flat import to match the worker's import root (see `events`)
+        # flat import to match the worker's import root (see `events`)
+        import db
         import storm_sampler
 
         for storm_feat in storms:
@@ -686,8 +689,11 @@ def _run_gpu_worker(args, payload=None):
                 print(f"[tasks:gpu] WARNING: storm {storm_ref} not found, skipping")
                 continue
             domain_placement = _storm_placement_to_domain(
-                storm_feat["placement"], xllcorner, yllcorner,
-                src_epsg=src_epsg, dst_epsg=dst_epsg,
+                storm_feat["placement"],
+                xllcorner,
+                yllcorner,
+                src_epsg=src_epsg,
+                dst_epsg=dst_epsg,
             )
             print(
                 f"[tasks:gpu] storm {storm_ref}: meta={storm_meta} "

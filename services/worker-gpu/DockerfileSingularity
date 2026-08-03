@@ -1,0 +1,100 @@
+# DockerfileSingularity — the SIF/HPC variant.
+#
+# Kept separate from the plain `Dockerfile` used for the k8s cluster, because
+# three changes here exist ONLY to satisfy Singularity's runtime model and are
+# unnecessary (though harmless) under Kubernetes:
+#   1. source in /opt, not /tmp  — Singularity binds the host /tmp over it
+#   2. non-editable pip install  — the SIF root is read-only squashfs
+#   3. PYTHONNOUSERSITE=1        — Singularity binds the host $HOME
+#
+# Build with:  docker build -f DockerfileSingularity -t anuga-gpu:latest .
+#
+# TWO WORKING CONFIGURATIONS — pick per target.
+#
+# (A) CONSERVATIVE, recommended — your original, proven toolchain.
+#       NVHPC_TAG=24.7-devel-cuda_multi-ubuntu22.04   GPU_ARCH=cc86,cc89
+#
+#     cuda_multi IS LOAD-BEARING, not just convenient. `docker build` has no
+#     GPU, so nvc reports "driver version (0)" and falls back to the OLDEST
+#     bundled CUDA toolkit — 11.8 for NVHPC 24.7. A single-CUDA base such as
+#     -cuda12.5- has no 11.8 to fall back to, and the build dies with:
+#       nvc-Error-A CUDA toolkit matching the current driver version (0) or
+#       a supported older version (11.8) was not installed with this HPC SDK.
+#
+#     If you do want the smaller single-CUDA base, name the toolkit explicitly
+#     so nvc never consults the driver at all:
+#       NVHPC_TAG=24.7-devel-cuda12.5-ubuntu22.04  GPU_ARCH=cc86,cc89,cuda12.5
+#     GPU_ARCH is interpolated verbatim into -gpu=, so `cuda12.5` is simply
+#     another sub-option alongside the cc targets.
+#
+# (B) NATIVE BLACKWELL, only if you need real sm_120 cubins instead of PTX JIT.
+#     Requires CUDA >= 12.8, the first toolkit supporting sm_120. Keep the
+#     cuda_multi variant for the same driver-detection reason as above.
+#       NVHPC_TAG=25.3-devel-cuda_multi-ubuntu22.04  GPU_ARCH=cc86,cc89,cc120
+#
+# Confirm a tag exists before building:
+#   curl -s https://nvcr.io/v2/nvidia/nvhpc/tags/list | tr ',' '\n' | grep devel
+ARG NVHPC_TAG=24.7-devel-cuda_multi-ubuntu22.04
+FROM nvcr.io/nvidia/nvhpc:${NVHPC_TAG}
+
+# cc86 = A40 (Ampere). cc89 = Ada, your existing known-good target, retained
+# both as insurance and as the PTX source that JITs onto the 5060.
+# Adding architectures is additive: it costs build time and image size, and
+# takes nothing away from what already works.
+ARG GPU_ARCH=cc86,cc89
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    MAX_JOBS=1 \
+    MAKEFLAGS="-j1" \
+    PYTHONNOUSERSITE=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      python3 python3-dev python3-pip python3-venv \
+      git wget curl build-essential gfortran \
+      libnetcdf-dev libhdf5-dev gdal-bin libgdal-dev \
+      swig pkg-config ninja-build \
+      openmpi-bin libopenmpi-dev \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN update-alternatives --install /usr/bin/python python /usr/bin/python3 1 && \
+    update-alternatives --install /usr/bin/pip pip /usr/bin/pip3 1
+
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
+    pip install --no-cache-dir \
+      "numpy>=2.0" scipy matplotlib netCDF4 \
+      cython meshpy pytest pybind11 \
+      meson meson-python ninja \
+      mpi4py
+
+# /opt, NOT /tmp: Singularity bind-mounts the host /tmp over the container's,
+# which would hide anything installed there.
+RUN git clone --branch develop --depth 1 \
+      https://github.com/anuga-community/anuga_core.git /opt/anuga-src
+
+# Regular install, not -e. meson-python editable installs rebuild on import,
+# which cannot work inside a read-only SIF.
+RUN cd /opt/anuga-src && \
+    CC=nvc CXX=nvc++ pip install --no-cache-dir --no-build-isolation . \
+      -Csetup-args=-Dgpu_offload=true \
+      -Csetup-args=-Dgpu_arch=${GPU_ARCH}
+
+# Non-fatal: `docker build` has no GPU access even on the laptop.
+RUN python -c "from anuga.shallow_water import sw_domain_gpu_ext; print('gpu ext import OK')" \
+    || echo "WARNING: gpu ext did not import at build time - verify at runtime"
+
+# Record what was targeted, so a container can be interrogated later.
+ENV ANUGA_BUILT_ARCH=${GPU_ARCH}
+RUN echo "gpu_arch=${GPU_ARCH}" > /opt/build-info.txt
+
+WORKDIR /app
+COPY requirements.txt /app/
+RUN pip install --no-cache-dir -r /app/requirements.txt
+
+# Both flattened into /app/src/ as in the original. COPY merges rather than
+# replaces, so mesh/ and src/ contents sit side by side here.
+COPY mesh/ /app/src/
+COPY src/  /app/src/
+
+ENV OMP_NUM_THREADS=1
+CMD ["python", "/app/src/worker.py"]

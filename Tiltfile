@@ -255,3 +255,17 @@ k8s_resource(
     resource_deps=["pgadmin-pgpass", "nip-tls"],
     links=[link("https://pgadmin.127.0.0.1.nip.io", "pgadmin")],
 )
+
+
+# Tailscale
+
+helm_repo("tailscale-repo", "https://pkgs.tailscale.com/helmcharts")
+helm_resource(
+    "tailscale-operator",
+    "tailscale-repo/tailscale-operator",
+    namespace="tailscale",
+    flags=["--create-namespace",
+           "--set", "oauth.clientId=" + secret_vars.get("TS_CLIENT_ID", ""),
+           "--set", "oauth.clientSecret=" + secret_vars.get("TS_CLIENT_SECRET", "")],
+    resource_deps=["tailscale-repo"],
+)

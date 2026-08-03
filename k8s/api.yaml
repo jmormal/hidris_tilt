@@ -101,3 +101,20 @@ spec:
                 name: api
                 port:
                   number: 80
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api-ts
+  annotations:
+    tailscale.com/hostname: "api"
+spec:
+  ingressClassName: tailscale
+  defaultBackend:
+    service:
+      name: api
+      port:
+        number: 80
+  tls:
+    - hosts:
+        - api

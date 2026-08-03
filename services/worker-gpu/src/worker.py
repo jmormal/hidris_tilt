@@ -26,7 +26,7 @@ MAX_SPOT_RETRIES = 3
 
 WORKER_NAME = f"worker-{uuid.uuid4().hex[:8]}"
 WORKER_QUEUES = os.getenv("QUEUE", "jobs:gpu").split(",")
-REDIS_URL = os.getenv("TETIS_REDIS_URL", "redis://redis:6379")
+REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")
 
 
 class SpotGracefulWorker(Worker):
@@ -95,15 +95,13 @@ class SpotGracefulWorker(Worker):
 if __name__ == "__main__":
     import tasks  # noqa: F401
 
-    REDIS_URL = os.getenv("REDIS_URL", "localhost")
     REDIS_QUEUE = os.getenv("REDIS_CPU", "jobs:gpu")
     WORKER_QUEUES = os.getenv("QUEUE", "jobs:gpu").split(",")
-    REDIS_URL = os.getenv("TETIS_REDIS_URL", "redis://redis:6379")
+    REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")
     print(REDIS_URL)
     redis_conn = Redis.from_url(REDIS_URL)
     print(f"[{WORKER_NAME}] Starting spot-safe worker")
 
     queues = [Queue(name, connection=redis_conn) for name in WORKER_QUEUES]
-    worker = SpotGracefulWorker(
-        queues, connection=redis_conn, name=WORKER_NAME)
+    worker = SpotGracefulWorker(queues, connection=redis_conn, name=WORKER_NAME)
     worker.work()
