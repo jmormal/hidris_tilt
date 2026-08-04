@@ -127,8 +127,10 @@ def run_anuga(
     out-of-process via `tasks.py --gpu-worker` when ANUGA_GPU_SUBPROCESS=1.
 
     The job is enqueued as {"public_id": ..., "payload": {config, features}}.
-    The gzipped binary result container is persisted to Postgres on completion
-    and also returned (bytes) for convenience / the out-of-process path.
+    The gzipped binary result container is persisted to Postgres on completion;
+    the return value is only a small summary, since RQ pickles it into Redis
+    for RESULT_TTL and a real result runs to hundreds of MB. Clients read the
+    solution back through GET /api/instances/{id}/result.
     """
     from rq import get_current_job
     from events import channel_for, encode
@@ -160,6 +162,14 @@ def run_anuga(
         elevation_file = os.path.abspath(elevation_file)
 
     print(elevation_file)
+
+    def _summary(gz_bytes):
+        """What goes back to RQ (and therefore into Redis) — never the blob."""
+        return {
+            "public_id": public_id,
+            "persisted": public_id is not None,
+            "bytes": len(gz_bytes),
+        }
 
     def _persist_and_notify(gz_bytes):
         """Write the gzipped solution to the DB (if we know the instance) and
@@ -204,7 +214,7 @@ def run_anuga(
         )
         result = _run_gpu_worker(args, payload=payload)  # gzipped bytes
         _persist_and_notify(result)
-        return result
+        return _summary(result)
 
     # ---- Out-of-process path ----
     workdir = tempfile.mkdtemp(prefix=f"anuga_{job_id}_")
@@ -279,7 +289,7 @@ def run_anuga(
 
         # Parent worker (which has DB access) persists; the subprocess does not.
         _persist_and_notify(result)
-        return result
+        return _summary(result)
 
     finally:
         if proc is not None and proc.poll() is None:

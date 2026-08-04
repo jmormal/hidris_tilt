@@ -21,7 +21,6 @@ from rq import Worker, Queue
 from tasks import run_anuga
 
 # --- Cmnfiguration ---
-WORKER_QUEUES = ["jobs:cpu"]
 MAX_SPOT_RETRIES = 3
 
 WORKER_NAME = f"worker-{uuid.uuid4().hex[:8]}"
