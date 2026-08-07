@@ -1,0 +1,9 @@
+# The filled-in env file: holds TS_AUTHKEY and PG_PASSWORD. Lives on the
+# cluster (chmod 600), never here. Only probe.env.example is committed, and it
+# must stay blank — see the note at the top of it.
+probe.env
+
+# Build artefacts. The SIF is ~85MB; ship it with rsync, not git.
+*.sif
+.sing-tmp/
+.sing-cache/

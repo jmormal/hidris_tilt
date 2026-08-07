@@ -68,6 +68,10 @@ spec:
               value: "hidris-db-rw" # The Read/Write service
             - name: DB_NAME
               value: "hidris"
+            # Login name on vrhpcadm1 (AD-style, contains an "@"). Per-service,
+            # so it lives here rather than in config.env.
+            - name: HPC_SSH_USER
+              value: "jmormal@upvnet.upv.es"
 ---
 apiVersion: v1
 kind: Service
@@ -118,3 +122,19 @@ spec:
   tls:
     - hosts:
         - api
+---
+# Egress: the reverse of the ingresses above. The tailscale operator turns this
+# ExternalName into a proxy StatefulSet in the "tailscale" namespace that
+# forwards cluster traffic OUT to the tailnet, so pods can reach the HPC login
+# node as plain "vrhpcadm1" with no tailscaled sidecar of their own.
+# The proxy device is tagged tag:k8s — that tag is what the Tailscale SSH ACL
+# rule on vrhpcadm1 must accept as src.
+apiVersion: v1
+kind: Service
+metadata:
+  name: vrhpcadm1
+  annotations:
+    tailscale.com/tailnet-fqdn: vrhpcadm1.tail51f978.ts.net
+spec:
+  type: ExternalName
+  externalName: placeholder # the operator rewrites this to its proxy service
