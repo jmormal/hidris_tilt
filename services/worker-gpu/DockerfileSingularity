@@ -91,10 +91,50 @@ WORKDIR /app
 COPY requirements.txt /app/
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
+# --- HPC networking ---------------------------------------------------------
+# Deliberately placed AFTER the ANUGA build: those layers are ~36GB and take an
+# hour, so anything that changes often must sit below them in the cache order.
+#
+# On the compute nodes the DB and Redis are only reachable over Tailscale, and
+# there is no CAP_NET_ADMIN — see services/hpc-probe for the measurements. Two
+# transports are shipped: netns (unshare + slirp4netns, real TUN, psycopg2 works
+# unmodified at native speed) and proxychains as the fallback.
+ARG TS_VERSION=1.86.2
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      proxychains4 slirp4netns uidmap iproute2 curl ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN set -eux; \
+    curl -fsSL "https://pkgs.tailscale.com/stable/tailscale_${TS_VERSION}_amd64.tgz" \
+      -o /tmp/ts.tgz; \
+    tar -xzf /tmp/ts.tgz -C /tmp; \
+    mv "/tmp/tailscale_${TS_VERSION}_amd64/tailscale" \
+       "/tmp/tailscale_${TS_VERSION}_amd64/tailscaled" /usr/local/bin/; \
+    rm -rf /tmp/ts.tgz "/tmp/tailscale_${TS_VERSION}_amd64"; \
+    tailscaled --version
+
+# proxy_dns is load-bearing: MagicDNS names must be resolved by tailscaled on
+# the far side of the proxy, since the node's own resolver knows nothing of them.
+RUN printf '%s\n' 'strict_chain' 'proxy_dns' 'remote_dns_subnet 224' \
+      'tcp_read_time_out 15000' 'tcp_connect_time_out 10000' \
+      '[ProxyList]' 'socks5 127.0.0.1 1055' > /etc/proxychains4.conf
+
+COPY hpc-entrypoint.sh /opt/hpc/entrypoint.sh
+COPY netns-run.sh      /opt/hpc/netns-run.sh
+RUN chmod +x /opt/hpc/entrypoint.sh /opt/hpc/netns-run.sh
+
 # Both flattened into /app/src/ as in the original. COPY merges rather than
 # replaces, so mesh/ and src/ contents sit side by side here.
 COPY mesh/ /app/src/
 COPY src/  /app/src/
 
 ENV OMP_NUM_THREADS=1
-CMD ["python", "/app/src/worker.py"]
+
+# HPC variant runs ONE simulation and exits — Slurm is the scheduler, so there
+# is no queue to drain and no worker loop. This is what `singularity run` (and
+# so run-simulation.slurm) executes.
+#
+# The RQ worker that the k8s image uses is still in here if it is ever wanted:
+#   singularity exec anuga-gpu.sif python /app/src/worker.py
+ENTRYPOINT ["/opt/hpc/entrypoint.sh"]
+CMD []

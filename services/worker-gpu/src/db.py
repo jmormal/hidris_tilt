@@ -126,6 +126,28 @@ def get_instance(user_id: str, public_id: str):
             return cur.fetchone()
 
 
+def get_instance_by_public_id(public_id: str):
+    """Worker-side read, not scoped to a user.
+
+    Every API-facing query filters on (public_id, user_id) so cross-user access
+    is impossible by construction. A worker has no user context — it acts on
+    behalf of whoever owns the row, exactly like save_solution_bytes — so it
+    looks the instance up by public_id alone. Never expose this through a route.
+    """
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT public_id, instance_name, instance_description,
+                       is_solved, created_at, updated_at, instance
+                FROM simulations
+                WHERE public_id = %s;
+                """,
+                (public_id,),
+            )
+            return cur.fetchone()
+
+
 def update_instance(
     user_id: str,
     public_id: str,

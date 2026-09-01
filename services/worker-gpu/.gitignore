@@ -1,0 +1,6 @@
+.local-run
+.local-run-tailnet
+.sing-cache
+.sing-tmp
+*.sif
+scratch
