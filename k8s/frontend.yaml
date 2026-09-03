@@ -18,14 +18,14 @@ spec:
           # public-facing pod and has no business holding the DB/MinIO/Keycloak
           # credentials that live in that Secret. vite.config.ts reads this at
           # dev-server start and inlines it into the bundle (unavoidable: the
-          # Google 3D Tiles API is called from the browser), so restrict the key
-          # by HTTP referrer in the Google Cloud console.
+          # Cesium ion API is called from the browser), so scope the token to
+          # the Google Photorealistic 3D Tiles asset in the ion console.
           env:
-            - name: GOOGLE_API_KEY
+            - name: CESIUM_API_KEY
               valueFrom:
                 secretKeyRef:
                   name: app-secrets
-                  key: GOOGLE_API_KEY
+                  key: CESIUM_API_KEY
                   optional: true
           ports:
             - containerPort: 3000

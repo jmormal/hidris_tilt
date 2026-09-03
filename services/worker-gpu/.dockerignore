@@ -1,0 +1,14 @@
+.git
+.local-run
+.local-run-tailnet
+.sing-cache
+.sing-tmp
+scratch
+*.sif
+oldmesh
+src/__pycache__
+HPC-RESUME.md
+run-local-worker.sh
+run-local-worker-tailnet.sh
+run-local-worker3.sh
+local.env
