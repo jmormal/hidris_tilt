@@ -163,6 +163,34 @@ def run_anuga(
 
     print(elevation_file)
 
+    def _enqueue_kpi_job(public_id: str, job):
+        """Enqueue a KPI computation for this instance on jobs:kpi (drained
+        by worker-kpi, not this worker). Never raises — the simulation job
+        already succeeded by the time this runs, and a flaky KPI-queue push
+        shouldn't retroactively fail it. A missed KPI job just means the
+        instance's KPIs stay stale until POST /kpis/recompute is called."""
+        try:
+            from rq import Queue
+
+            queue_name = os.getenv("QUEUE_KPI", "jobs:kpi")
+            if job is not None:
+                conn = job.connection
+            else:
+                from redis import Redis
+
+                conn = Redis.from_url(os.getenv("TETIS_REDIS_URL", "redis://redis:6379"))
+            # RQ's default job timeout (180s) is too short for a first-time
+            # OSM ingestion pass over a basin — see main.py's KPI_JOB_TIMEOUT.
+            kpi_job_timeout = int(os.getenv("KPI_JOB_TIMEOUT", "1200"))
+            Queue(queue_name, connection=conn).enqueue(
+                "tasks.compute_kpis",
+                {"public_id": public_id},
+                job_timeout=kpi_job_timeout,
+            )
+            print(f"WORKER: enqueued KPI job for {public_id} on {queue_name}")
+        except Exception as e:
+            print(f"WORKER: failed to enqueue KPI job for {public_id}: {e}")
+
     def _summary(gz_bytes):
         """What goes back to RQ (and therefore into Redis) — never the blob."""
         return {
@@ -189,6 +217,12 @@ def run_anuga(
                         ),
                     )
                 raise
+
+            # KPI computation runs on its own queue/worker (worker-kpi),
+            # entirely decoupled from the solve — see docs/architecture.md.
+            # _enqueue_kpi_job swallows its own failures: a KPI-enqueue
+            # problem must never fail the simulation job that just succeeded.
+            _enqueue_kpi_job(public_id, job)
 
         if job is not None:
             job.meta["progress"] = 1.0

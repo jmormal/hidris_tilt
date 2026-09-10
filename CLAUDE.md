@@ -11,6 +11,15 @@ mesh animated over time. Runs on k3d (local Kubernetes) with Traefik routing and
 Tilt for the live-reload dev loop. `ideas.md` (Spanish) has the product roadmap —
 worth checking for the "why" behind in-progress features.
 
+For deep dives beyond this file's overview, `docs/` has three long-form,
+file-and-line-referenced write-ups: `docs/architecture.md` (full job lifecycle,
+auth, data model, infra — read this first), `docs/frontend-react.md` (a React
+tour of the frontend, concept-by-concept), and `docs/solution-binary-format.md`
+(the `HFR1` binary container spec). They're worth reading directly rather than
+summarized here — each also lists known dead ends and stale leftovers in the
+code. The root `README.md` is stale (describes an old three-service Node.js
+prototype) — ignore it.
+
 ## Repository layout
 
 This is a **superproject with git submodules**:
@@ -20,7 +29,7 @@ This is a **superproject with git submodules**:
 
 Both have their own `.git`. When editing files inside them, commits happen in the
 submodule's own repo, not the superproject — check `git status`/`git remote -v`
-inside the submodule if unsure which repo you're in. `worker-cpu` and `worker-gpu`
+inside the submodule if unsure which repo you're in. `worker-cpu`, `worker-gpu`, `hpc-probe`, and `jupyter`
 are NOT submodules (plain directories in the main repo).
 
 ```
@@ -34,7 +43,10 @@ are NOT submodules (plain directories in the main repo).
     ├── frontend/                # React/TS UI — submodule
     ├── api/                     # FastAPI REST API — submodule
     ├── worker-cpu/               # RQ worker, ANUGA on CPU
-    ├── worker-gpu/               # RQ worker, ANUGA on GPU (custom CUDA build)
+    ├── worker-gpu/               # RQ worker, ANUGA on GPU (custom CUDA build); also the
+    │                             #   source for the Singularity image used on external HPC
+    ├── hpc-probe/                # tiny SIF that smoke-tests the Tailscale path to an
+    │                             #   external HPC cluster (see "HPC execution path" below)
     └── jupyter/                  # notebook environment
 ```
 
@@ -119,7 +131,8 @@ that service's k8s manifest/pod spec, not in these shared files.
    from the `worker-cpu`/`worker-gpu` images to drain `jobs:cpu`/`jobs:gpu`
    (`k8s/keda-cpu.yaml`, `k8s/keda-gpu.yaml`). Workers are **run-once**: pull
    one item, process, exit — they must never loop internally in a way KEDA
-   doesn't expect.
+   doesn't expect. This is one of two execution paths — see "HPC execution
+   path" below for the other.
 6. Workers publish progress over Redis pub/sub using the shared contract in
    `events.py` (duplicated identically in `services/api/src/events.py` and
    each worker's `src/events.py` — keep them in sync if the event shape
@@ -130,12 +143,12 @@ that service's k8s manifest/pod spec, not in these shared files.
    blocking `pubsub.get_message`, hands off to the asyncio loop via
    `call_soon_threadsafe`, with a heartbeat comment every `SSE_HEARTBEAT`
    seconds to keep the connection alive.
-8. On completion the worker gzips the result and writes it directly into the
-   `simulations.solution` BYTEA column (`db.save_solution` /
-   `save_solution_bytes` — the GPU worker pre-gzips to avoid double
-   compression), flipping `is_solved`. The frontend fetches it via
-   `GET /api/instances/{id}/result`, which streams the gzip bytes back with
-   `Content-Encoding: gzip` for the browser to inflate.
+8. On completion the worker gzips the result and writes it into a Postgres
+   large object via `db.save_solution_bytes` (the GPU worker pre-gzips to
+   avoid double compression), flipping `is_solved` — see "Data model" below
+   for why it's a large object rather than an inline column. The frontend
+   fetches it via `GET /api/instances/{id}/result`, which streams the gzip
+   bytes back with `Content-Encoding: gzip` for the browser to inflate.
 9. Job *status* (as opposed to result data) is polled via `/job-status/{id}`
    (RQ registries: queued/started/finished/failed/scheduled) or read from
    `job.meta` (`progress`, `status_message`) — the SSE stream is the intended
@@ -159,24 +172,63 @@ toolchain (`nvcr.io/nvidia/nvhpc:24.7-devel-cuda_multi-ubuntu22.04`) targeting
 `requirements.txt` changes into a running container for this image (full
 rebuild required) because it sits on top of a multi-GB compiled base.
 
+### HPC execution path (in progress)
+
+Beyond the k3d/KEDA path above, `POST /api/instances/{id}/simulate` accepts a
+`target: "cluster" | "hpc" | "slurm"` field (`services/api/src/main.py`,
+default `"cluster"`). `"hpc"`/`"slurm"` submit the same simulation to an
+**external Slurm cluster** instead of enqueuing for KEDA:
+
+- `services/api/src/hpc.py` runs Slurm commands (`sbatch`, job-state queries)
+  over SSH via `src/remote.py`, validating every interpolated id (Slurm job id
+  or UUID) before it reaches a remote shell.
+- The cluster reaches this stack's Redis/Postgres over a **Tailscale tailnet**
+  from inside the job (`services/worker-gpu/hpc-entrypoint.sh`,
+  `netns-run.sh`) — compute nodes lack `CAP_NET_ADMIN`, so `tailscaled` runs
+  userspace and the job's network namespace is bridged onto it. `hpc_run.py`
+  (`services/worker-gpu/src/hpc_run.py`) then runs the same ANUGA solve logic
+  and publishes to the same `sim:events:{job_id}` channel, so the frontend's
+  existing SSE stream works unmodified for either target.
+- The worker runs from a Singularity/SIF image built from the `worker-gpu`
+  Dockerfile — see `services/worker-gpu/HPC-RESUME.md` for the build/ship
+  procedure and current state (**as of the last update, this path has never
+  been run end-to-end** — treat it as unverified, not production).
+- `services/hpc-probe` is a small, fast-building SIF used to test just the
+  tailnet connectivity question (which transport reaches Redis/Postgres from
+  a compute node) in isolation from the multi-GB `worker-gpu` image.
+- `GET /api/hpc/simulation/{slurm_job_id}/log` is the diagnostic when SSE goes
+  quiet — a job that dies before the tailnet comes up can't reach Redis to
+  report anything, so the Slurm `.out` log is the only evidence.
+- The queue name mismatch matters here too: `q_hpc` uses `jobs:hpc`
+  (`QUEUE_HPC` env var), a separate queue from KEDA's `jobs:gpu`/`jobs:cpu`,
+  specifically so an HPC-drained job never races KEDA for the same item.
+
 ### Frontend architecture (`services/frontend`)
 
 React + TypeScript + Vite + Tailwind v4, MapLibre GL for the basemap, deck.gl
-for the GPU-accelerated flood mesh overlay. State is split across two React
-contexts built with `useReducer`:
+for the GPU-accelerated flood mesh overlay, plus a `/3d/:id` route
+(`pages/Instance3D.tsx`) that renders the same solution as real terrain/water
+geometry rather than a flat overlay. State is split across two React
+contexts, each further split into a state context and an actions context
+(`useReducer` underneath) so components that only dispatch don't re-render
+on every playback tick:
 
 - `FloodProvider` / `FloodContext` — the flood dataset, playback (frame index,
-  play/pause, speed), decoded frame cache.
+  play/pause, speed), precomputed per-frame color buffers.
 - `SimulationProvider` / `SimulationContext` — the in-progress simulation
-  setup (drawn polygons/boundary conditions, submission state).
+  setup (drawn polygons/boundary conditions, submission state, SSE stream).
 
-`useFloodLayer` memoizes the deck.gl `SolidPolygonLayer` from decoded frame
-data; `FloodMap` composes it onto MapLibre via `react-map-gl`'s
-`MapboxOverlay`. `src/config/theme.ts` is the single source of truth for
-map style, playback speeds, colors, and property labels — prefer editing it
-over hardcoding values in components. Flood data frames are RLE-encoded and
-decoded on demand through an LRU cache (`utils/decode.ts`) since full
-per-frame mesh data would be too large to keep resident.
+The flood mesh layer (a deck.gl `SolidPolygonLayer`) is built inline in
+`FloodMap.tsx`, memoized with `useMemo`/`updateTriggers` — there is no
+separate `useFloodLayer` hook. `src/config/theme.ts` and
+`src/config/polygonTypes.ts` are the sources of truth for map style,
+playback speeds, colors/labels, and polygon-type definitions (properties,
+draw behavior) respectively — prefer editing these registries over
+hardcoding values in components. The solution format is a custom binary
+container (`HFR1`, see `docs/solution-binary-format.md`), not JSON — a large
+run's JSON would exceed V8's ~512MB single-string cap. `utils/decode.ts` and
+related RLE-era stubs are dead code kept only so old imports resolve; the
+real path is `utils/decodeResult.ts`.
 
 `src/utils/api.ts` is the typed client for all instance endpoints; every call
 goes through `authFetch` so token refresh is never duplicated per-call.
@@ -190,7 +242,12 @@ Two independent schemas set up idempotently in `services/api/src/db.py`:
   `user_id` scoped to the Keycloak `sub` claim (all queries filter by both
   `public_id` and `user_id`, so cross-user access is impossible by
   construction, not by an extra authz check), `instance` JSONB (the drawn
-  setup), `solution` BYTEA (gzipped result), `is_solved`.
+  setup), `is_solved`. The gzipped result itself lives in a Postgres **large
+  object** referenced by `solution_oid` (`db.save_solution_bytes` writes it in
+  8 MiB chunks — an inline `bytea` parameter over ~500MB gets rejected by
+  Postgres because psycopg2 hex-escapes it into the SQL text, doubling the
+  size); a legacy inline `solution` BYTEA column is still read as a fallback
+  for rows written before this change.
 - `storm_catalog` / `storm_raster_data` — historical storm rainfall rasters
   (PostGIS `postgis`/`postgis_raster` extensions), served as tiles via Martin
   (`k8s/martin.yaml`). SQL functions for tile/value lookups live in

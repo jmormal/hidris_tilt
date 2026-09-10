@@ -1,0 +1,64 @@
+apiVersion: keda.sh/v1alpha1
+kind: ScaledJob
+metadata:
+  name: worker-kpi
+spec:
+  scalingStrategy:
+    strategy: eager
+  minReplicaCount: 0
+  maxReplicaCount: 4
+  pollingInterval: 15
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  triggers:
+    - type: redis
+      metadata:
+        address: redis.default.svc.cluster.local:6379
+        listName: rq:queue:jobs:kpi
+        listLength: "1"
+  jobTargetRef:
+    # Unlike worker-cpu's MPI job, a KPI computation is idempotent (it just
+    # re-derives from the already-stored solution + cached OSM data), so one
+    # retry on a transient failure (e.g. a flaky Overpass call) is safe.
+    backoffLimit: 1
+    template:
+      spec:
+        restartPolicy: Never
+        # Above KPI_JOB_TIMEOUT (config.env, default 1200s) so RQ's own
+        # timeout fires first and marks the job failed cleanly, rather than
+        # k8s killing the pod out from under a still-running RQ job.
+        activeDeadlineSeconds: 1500
+        containers:
+          - name: worker
+            image: worker-kpi
+            resources:
+              requests:
+                cpu: "1"
+                memory: "1Gi"
+              limits:
+                cpu: "2"
+                memory: "2Gi"
+            envFrom:
+              - configMapRef:
+                  name: app-config
+              - secretRef:
+                  name: app-secrets
+            env:
+              - name: QUEUE
+                value: "jobs:kpi"
+              - name: PYTHONUNBUFFERED
+                value: "1"
+              - name: PG_USER
+                valueFrom:
+                  secretKeyRef:
+                    name: hidris-db-app
+                    key: username
+              - name: PG_PASSWORD
+                valueFrom:
+                  secretKeyRef:
+                    name: hidris-db-app
+                    key: password
+              - name: DB_HOST
+                value: "hidris-db-rw"
+              - name: DB_NAME
+                value: "hidris"

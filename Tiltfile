@@ -169,6 +169,9 @@ k8s_resource(
 # (worker-cpu <- jobs:cpu, worker-gpu <- jobs:gpu). See keda-*.yaml below.
 worker_build("worker-cpu", "./services/worker-cpu")
 worker_build("worker-gpu", "./services/worker-gpu", live_pip=False)
+# KPI computation runs post-solve, decoupled from ANUGA entirely (its own
+# queue, jobs:kpi) so redefining a KPI never means re-running a simulation.
+worker_build("worker-kpi", "./services/worker-kpi")
 
 # ── Infra (prebuilt images) ───────────────────────────────────────────────────
 service_image("minio", links=[link("https://minio.127.0.0.1.nip.io", "minio console")], resource_deps=["nip-tls"])
@@ -202,9 +205,15 @@ k8s_resource(
     resource_deps=["keda", "redis"],
 )
 
+k8s_yaml("./k8s/keda-kpi.yaml")
+k8s_resource(
+    "worker-kpi", # Target the auto-created resource directly
+    resource_deps=["keda", "redis"],
+)
+
 # in Tiltfile, alongside service_image("redis") etc.
 k8s_yaml("./k8s/keycloak-realm.yaml")   # ConfigMap first
-service_image("keycloak", links=[link("https://keycloak.127.0.0.1.nip.io", "keycloak")], resource_deps=["nip-tls"])
+service_image("keycloak", links=[link("https://keycloak.127.0.0.1.nip.io", "keycloak")], resource_deps=["nip-tls", "keycloak-db"])
 
 
 # ── CloudNativePG (Postgres Operator) ─────────────────────────────────────────
@@ -228,6 +237,11 @@ k8s_resource(
     new_name="hidris-db",
     objects=["hidris-db:cluster"], # Selector format: [metadata.name]:[kind]
     resource_deps=["cnpg"],        # Still waits for the operator to be ready
+)
+k8s_resource(
+    new_name="keycloak-db",
+    objects=["keycloak-db:cluster"],
+    resource_deps=["cnpg"],        # Wait for the CNPG CRDs/operator to exist
 )
 # ── pgAdmin ───────────────────────────────────────────────────────────────────
 # Deploy pgAdmin, then create its passfile secret from the CNPG-generated

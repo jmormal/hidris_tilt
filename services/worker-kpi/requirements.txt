@@ -1,0 +1,8 @@
+redis
+rq
+psycopg2-binary
+numpy
+shapely>=2.0
+geopandas
+osmnx
+pyproj
