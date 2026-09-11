@@ -100,6 +100,11 @@ chmod 600 "$CONTAINERS/hidris-sim-${SLURM_JOB_ID}.out" 2>/dev/null || true
 # submitter actually asked for, so this follows the UI's GPU selector without
 # the API having to pass a second, redundant number that could disagree with it.
 NTASKS="${HPC_NTASKS:-${SLURM_GPUS_ON_NODE:-1}}"
+# Storm cubes are ~666MB and immutable for a given storm_ref, but live in
+# Postgres across the tailnet — a DERP-relayed link measured at ~3 MB/s, so
+# ~4 minutes per fetch. Cache them in the shared containers dir so repeat runs
+# read from disk instead. Cleared by hand; they are pure cache.
+mkdir -p "$CONTAINERS/storm-cache"
 echo "ranks=$NTASKS (gpus on node=${SLURM_GPUS_ON_NODE:-unset})"
 
 echo "host=$(hostname) job=$SLURM_JOB_ID instance=$PUBLIC_ID stream=$JOB_ID"
@@ -117,7 +122,8 @@ singularity run \
   --nv \
   --cleanenv \
   --env-file "$ENVFILE" \
-  --env "PUBLIC_ID=${PUBLIC_ID},JOB_ID=${JOB_ID},HPC_WORKDIR=/scratch,HPC_STATEDIR=/ts-state,SLURM_JOB_ID=${SLURM_JOB_ID},PGPASSFILE=/pgpass,HPC_NTASKS=${NTASKS}" \
+  --env "PUBLIC_ID=${PUBLIC_ID},JOB_ID=${JOB_ID},HPC_WORKDIR=/scratch,HPC_STATEDIR=/ts-state,SLURM_JOB_ID=${SLURM_JOB_ID},PGPASSFILE=/pgpass,HPC_NTASKS=${NTASKS},HPC_STORM_CACHE=/storm-cache" \
+  -B "$CONTAINERS/storm-cache:/storm-cache" \
   -B "$WORKDIR:/scratch" \
   -B "$STATEROOT:/ts-state" \
   -B "$PGPASS:/pgpass:ro" \

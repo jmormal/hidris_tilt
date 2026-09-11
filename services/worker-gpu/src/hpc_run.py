@@ -53,6 +53,32 @@ def publish(event: str, data: dict) -> None:
         print(f"[hpc_run] progress publish failed: {exc}", file=sys.stderr)
 
 
+def _abort_peers() -> None:
+    """Tear the whole MPI job down after a failure on this rank.
+
+    Returning normally is not enough. mpi4py calls MPI_Finalize at interpreter
+    exit and that is COLLECTIVE, so a failed rank blocks there while its peers
+    sit in whatever collective they had reached — typically a bcast or Gatherv
+    that will never be satisfied. No process exits, mpirun sees nothing wrong,
+    and Slurm runs the job to its wall clock: one NameError cost a 4-hour
+    allocation and held its GPUs the whole time.
+
+    Abort() bypasses the collective and kills every rank, so the job ends in
+    seconds. The `error` event has already been published by the caller, so the
+    frontend still learns what happened.
+    """
+    if _NUMPROCS <= 1:
+        return
+    try:
+        from mpi4py import MPI
+
+        print(f"[hpc_run] rank {_MYID}: aborting all {_NUMPROCS} ranks",
+              file=sys.stderr, flush=True)
+        MPI.COMM_WORLD.Abort(1)
+    except Exception:  # noqa: BLE001
+        os._exit(1)  # last resort: never leave peers hanging in a collective
+
+
 def prepare_workdir() -> str:
     """Make a writable CWD that still looks like /app to tasks.py.
 
@@ -134,6 +160,7 @@ def main() -> int:
         traceback.print_exc()
         if _IS_ROOT:
             publish("error", {"detail": f"Simulation failed: {exc}"})
+        _abort_peers()
         return 1
 
     # Under mpirun every rank runs this file. Only rank 0 comes back with the
@@ -164,6 +191,7 @@ def main() -> int:
         traceback.print_exc()
         publish("error", {"detail": f"Failed to store solution: {exc}. "
                                     f"Result is spooled at {spool}"})
+        _abort_peers()
         return 1
 
     print(f"[hpc_run] stored {len(gz_bytes)} bytes for {PUBLIC_ID}")

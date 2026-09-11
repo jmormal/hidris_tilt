@@ -363,6 +363,82 @@ def _close_ring_removed(coords):
 _METRES_PER_DEG_LAT = 111_320
 
 
+def _fetch_storm_cube(storm_ref, par):
+    """The storm cube, fetched ONCE per job rather than once per rank.
+
+    The cube is ~666MB and lives in a Postgres large object reached over the
+    tailnet. Measured on a DERP-relayed link that is ~3 MB/s, i.e. ~4 minutes
+    per copy — and every rank was paying it, so an N-GPU run spent N x 4 min
+    parked at 0% before meshing even started. Two layers:
+
+      1. A local cache keyed by storm_ref. A stored cube never changes, so a
+         re-run costs a disk read instead of a download.
+      2. Rank 0 fetches and MPI-broadcasts. Intra-node shared memory moves
+         666MB in well under a second, against minutes over the tailnet.
+
+    Cache lives beside the job's scratch, not in the image, and a failure to
+    write it is not fatal — it is an optimisation, not state.
+    """
+    # `db` is imported function-locally everywhere else in this module (see
+    # run_anuga and the storm loop) rather than at module scope, so it is NOT a
+    # global here. Omitting this raised NameError on the first real run and,
+    # because a rank-0 exception under MPI deadlocks rather than exits (see
+    # hpc_run.py), the job then held its GPUs until the wall clock expired.
+    import db
+
+    cache_dir = os.getenv("HPC_STORM_CACHE", "")
+    cache = os.path.join(cache_dir, f"storm-{storm_ref}.npz") if cache_dir else ""
+
+    def _load_local():
+        if cache and os.path.exists(cache):
+            try:
+                with np.load(cache, allow_pickle=True) as z:
+                    print(f"[tasks:gpu] storm {storm_ref}: cache hit {cache}")
+                    return z["cube"], z["meta"].item()
+            except Exception as exc:  # noqa: BLE001
+                print(f"[tasks:gpu] storm cache unreadable ({exc}); refetching")
+        return None, None
+
+    if not par["parallel"]:
+        cube, meta = _load_local()
+        if cube is None:
+            cube, meta = db.get_storm_cube(storm_ref)
+            if cube is not None and cache:
+                try:
+                    np.savez(cache, cube=cube, meta=np.array(meta, dtype=object))
+                except OSError as exc:
+                    print(f"[tasks:gpu] could not cache storm: {exc}")
+        return cube, meta
+
+    comm, myid = par["comm"], par["myid"]
+    cube = meta = None
+    if myid == 0:
+        cube, meta = _load_local()
+        if cube is None:
+            cube, meta = db.get_storm_cube(storm_ref)
+            if cube is not None and cache:
+                try:
+                    np.savez(cache, cube=cube, meta=np.array(meta, dtype=object))
+                except OSError as exc:
+                    print(f"[tasks:gpu] could not cache storm: {exc}")
+
+    # Shape/dtype first so the others can preallocate; None means "not found",
+    # and every rank must agree on that or they deadlock in the Bcast below.
+    header = comm.bcast(
+        None if cube is None else (cube.shape, str(cube.dtype), meta), root=0
+    )
+    if header is None:
+        return None, None
+    shape, dtype, meta = header
+    if myid != 0:
+        cube = np.empty(shape, dtype=np.dtype(dtype))
+    comm.Bcast(np.ascontiguousarray(cube) if myid == 0 else cube, root=0)
+    if myid == 0:
+        print(f"[tasks:gpu] storm {storm_ref}: broadcast {cube.nbytes/1e6:.0f}MB "
+              f"to {par['numprocs']} ranks")
+    return cube, meta
+
+
 def _storm_placement_to_domain(
     placement, xllcorner, yllcorner, src_epsg=4326, dst_epsg=25830
 ):
@@ -688,10 +764,20 @@ def _run_gpu_worker(args, payload=None):
         with open(args.payload) as f:
             payload = json.load(f)
 
+    # Rank identity up front: it gates the domain build below. anuga defines
+    # these even without MPI (0 and 1), so the serial path is unchanged.
+    from anuga import myid as _myid
+
+    _is_root = _myid == 0
+
     config = payload["config"]
     features = payload["features"]
     duration = config["duration"]
     yieldstep = config.get("output_timestep", args.yieldstep)
+
+    # Only rank 0 clips the DEM (below), so this must exist on every rank or the
+    # others NameError before they ever reach distribute().
+    elevation_file = None
 
     # ---- Reproject all feature polygons ----
     for ftype in [
@@ -707,7 +793,10 @@ def _run_gpu_worker(args, payload=None):
                 feat["geometry"]["coordinates"], src_epsg, dst_epsg
             )
 
-            if ftype == "region":
+            # Rank 0 only: this writes a ~512MB ASCII grid, and only rank 0's
+            # domain survives distribute(). Five ranks meant 2.5GB of duplicate
+            # NFS writes for one usable raster.
+            if ftype == "region" and _is_root:
                 elevation_file = clip_dem_to_asc(
                     feat["geometry"]["coordinates"],
                     ers_path="./src/MDT_malla_5m_etrs89h30.ers",
@@ -716,7 +805,8 @@ def _run_gpu_worker(args, payload=None):
                     out_path="region.asc",
                 )
 
-    print(f" elevation filw {elevation_file}")
+    if _is_root:
+        print(f"[tasks:gpu] elevation raster: {elevation_file}")
     sim_region = features["region"][0]
     abs_coords = _close_ring_removed(sim_region["_coords_proj"])
     xs, ys = zip(*abs_coords)
@@ -743,74 +833,96 @@ def _run_gpu_worker(args, payload=None):
         res_abs = res_feat["_coords_proj"]
         res_rel = [[x - xllcorner, y - yllcorner] for x, y in res_abs]
         interior_holes.append(res_rel)
-    domain = anuga.create_domain_from_regions(
-        rel_coords,
-        boundary_tags=boundary_tags,
-        maximum_triangle_area=config["mesh_max_area"],
-        interior_regions=interior_regions,
-        interior_holes=interior_holes,
-    )
-    domain.geo_reference = geo_ref
-    # domain.set_zone(dst_epsg - 25800)  # 30
-    # domain.geo_reference.zone = dst_epsg - 25800
-    # domain.geo_reference.south = False  # ETRS89/UTM30N is northern
-    # domain.geo_reference.hemisphere = "north"
-    domain.set_name(args.output_name)
-    # utm_zone = dst_epsg - 25800
-    # domain.set_zone(utm_zone)
-    domain.set_store(False)  # JSON is the product; skip per-yieldstep .sww
-    gr = domain.geo_reference
-    print("=== ZONE DEBUG ===")
-    print("domain.get_zone():", domain.get_zone())
-    print("geo_reference.zone:", getattr(gr, "zone", "MISSING"))
-    print(
-        "geo_reference.south / hemisphere:",
-        getattr(gr, "south", getattr(gr, "hemisphere", "MISSING")),
-    )
-    print("==================")
-    if config.get("flow_algorithm"):
-        # Cost per step on GPU: DE0 ~1x (Euler, ANUGA default),
-        # DE_ader2 ~1.1x (2nd order in time), DE1 ~2x (RK2), DE2 ~3x (RK3).
-        domain.set_flow_algorithm(config["flow_algorithm"])
+    # ---- Build the global domain: RANK 0 ONLY -----------------------------
+    # anuga's documented pattern (parallel/tests/run_parallel_distribute_domain.py,
+    # and the MPI page in the docs): the master builds, everyone else passes
+    # None to distribute(), which only ever reads its argument on rank 0.
+    #
+    # This is not a micro-optimisation. Every rank was meshing the SAME domain
+    # and throwing 'its copy away: a 5-rank job on a 2.2M-triangle mesh wrote
+    # five 512MB region.asc files to NFS and ran five single-threaded mesh
+    # builds against 4 allocated CPUs, all of it invisible because progress is
+    # only published once the solve starts.
+    #
+    # Everything above this point is cheap and deterministic (reprojection,
+    # boundary tags, relative coordinates) and every rank still needs those
+    # values afterwards to rebuild boundaries and operators on its own
+    # subdomain, so only the expensive part is guarded.
+    if _is_root:
+        domain = anuga.create_domain_from_regions(
+            rel_coords,
+            boundary_tags=boundary_tags,
+            maximum_triangle_area=config["mesh_max_area"],
+            interior_regions=interior_regions,
+            interior_holes=interior_holes,
+        )
+        domain.geo_reference = geo_ref
+        # domain.set_zone(dst_epsg - 25800)  # 30
+        # domain.geo_reference.zone = dst_epsg - 25800
+        # domain.geo_reference.south = False  # ETRS89/UTM30N is northern
+        # domain.geo_reference.hemisphere = "north"
+        domain.set_name(args.output_name)
+        # utm_zone = dst_epsg - 25800
+        # domain.set_zone(utm_zone)
+        domain.set_store(False)  # JSON is the product; skip per-yieldstep .sww
+        gr = domain.geo_reference
+        print("=== ZONE DEBUG ===")
+        print("domain.get_zone():", domain.get_zone())
+        print("geo_reference.zone:", getattr(gr, "zone", "MISSING"))
+        print(
+            "geo_reference.south / hemisphere:",
+            getattr(gr, "south", getattr(gr, "hemisphere", "MISSING")),
+        )
+        print("==================")
+        if config.get("flow_algorithm"):
+            # Cost per step on GPU: DE0 ~1x (Euler, ANUGA default),
+            # DE_ader2 ~1.1x (2nd order in time), DE1 ~2x (RK2), DE2 ~3x (RK3).
+            domain.set_flow_algorithm(config["flow_algorithm"])
 
-    # ---- Quantities (order matters: elevation before stage expression) ----
-    props = sim_region["properties"]
-    domain.set_quantity("elevation", filename=elevation_file, location="centroids")
-    domain.set_quantity(
-        "friction",
-        props.get("friction", config.get("manning_default", 0.03)),
-        location="centroids",
-    )
-    initial_stage = props.get("initial_stage")
-    if initial_stage is None:
-        # Dry start: water surface == terrain.
-        domain.set_quantity("stage", expression="elevation", location="centroids")
-    else:
-        domain.set_quantity("stage", initial_stage, location="centroids")
-
-    # ---- Boundaries (GPU-native types only -> keeps the fused C RK loop) ----
-    print(f" interior holes{interior_holes}")
-
-    B = []
-    print(features)
-    B = []
-    for elevation_feat in features.get("elevation", []):
-        coords_abs = elevation_feat["_coords_proj"]
-        coords_rel = [[x - xllcorner, y - yllcorner] for x, y in coords_abs]
-        value = elevation_feat["properties"]["elevation"]
-        B.append((coords_rel, value))
-
-    if B:
-        domain.add_quantity(
-            "elevation",
-            Polygon_function(B, default=0.0),
+        # ---- Quantities (order matters: elevation before stage expression) ----
+        props = sim_region["properties"]
+        domain.set_quantity("elevation", filename=elevation_file, location="centroids")
+        domain.set_quantity(
+            "friction",
+            props.get("friction", config.get("manning_default", 0.03)),
             location="centroids",
         )
-    # ---- Static per-triangle data (captured ONCE) ----
-    vertices = _build_vertices(domain, dst_epsg=dst_epsg, src_epsg=src_epsg)
-    tri_indices = np.asarray(domain.mesh.triangles, dtype=np.int64)
-    elev = np.array(domain.quantities["elevation"].centroid_values, dtype=np.float32)
-    friction = np.array(domain.quantities["friction"].centroid_values, dtype=np.float32)
+        initial_stage = props.get("initial_stage")
+        if initial_stage is None:
+            # Dry start: water surface == terrain.
+            domain.set_quantity("stage", expression="elevation", location="centroids")
+        else:
+            domain.set_quantity("stage", initial_stage, location="centroids")
+
+        # ---- Boundaries (GPU-native types only -> keeps the fused C RK loop) ----
+        print(f" interior holes{interior_holes}")
+
+        B = []
+        print(features)
+        B = []
+        for elevation_feat in features.get("elevation", []):
+            coords_abs = elevation_feat["_coords_proj"]
+            coords_rel = [[x - xllcorner, y - yllcorner] for x, y in coords_abs]
+            value = elevation_feat["properties"]["elevation"]
+            B.append((coords_rel, value))
+
+        if B:
+            domain.add_quantity(
+                "elevation",
+                Polygon_function(B, default=0.0),
+                location="centroids",
+            )
+        # ---- Static per-triangle data (captured ONCE) ----
+        vertices = _build_vertices(domain, dst_epsg=dst_epsg, src_epsg=src_epsg)
+        tri_indices = np.asarray(domain.mesh.triangles, dtype=np.int64)
+        elev = np.array(domain.quantities["elevation"].centroid_values, dtype=np.float32)
+        friction = np.array(domain.quantities["friction"].centroid_values, dtype=np.float32)
+    else:
+        # distribute() ignores this on non-root ranks; the globals below are
+        # rank 0's alone and are only used to build the result, which rank 0
+        # also does.
+        domain = None
+        vertices = tri_indices = elev = friction = None
     _publish_progress(args.job_id, 0, "Building domain")
 
     # ---- Partition across MPI ranks (no-op when running on one) -------------
@@ -895,7 +1007,7 @@ def _run_gpu_worker(args, payload=None):
 
         for storm_feat in storms:
             storm_ref = storm_feat["storm_ref"]
-            cube, storm_meta = db.get_storm_cube(storm_ref)
+            cube, storm_meta = _fetch_storm_cube(storm_ref, _par)
             if cube is None:
                 print(f"[tasks:gpu] WARNING: storm {storm_ref} not found, skipping")
                 continue
