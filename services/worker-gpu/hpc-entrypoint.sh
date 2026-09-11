@@ -24,21 +24,31 @@ mkdir -p "$WORKDIR"
 #
 # mpirun INSIDE the container, not srun outside it: Slurm's PMI does not reach
 # the container's OpenMPI, and two srun tasks each come up as an independent
-# 1-rank world (numprocs=1 twice, one GPU idle). --bind-to none because
-# OpenMPI's default binding collides with the cpuset Slurm hands us and dies
-# with hwloc_set_cpubind "Error".
+# 1-rank world (numprocs=1 twice, one GPU idle, no error).
+#
+# --bind-to none because OpenMPI's default binding collides with the cpuset
+# Slurm hands us and dies with hwloc_set_cpubind "Error". Note that binding is
+# then left to OpenMP — which is why worker.env must NOT set OMP_PROC_BIND or
+# OMP_PLACES: every rank would compute its place list from the full cpuset,
+# pin to the same core, and each blocking MPI sync would then wait a full
+# scheduler slice (24ms here). Measured 44.67ms/timestep vs 1.10ms.
+#
+# OMPI_ALLOW_RUN_AS_ROOT: the netns transport runs us under
+# `unshare --map-root-user`, so we appear as uid 0 and mpirun refuses to start
+# ("attempt to run as root"). Without these, every multi-rank job silently fell
+# back to the proxychains path — which works, but puts the DB and Redis traffic
+# through a userspace SOCKS stack instead of the netns TUN. We are not really
+# root; this is a mapped uid inside a user namespace.
+export OMPI_ALLOW_RUN_AS_ROOT=1
+export OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
+
 solver_cmd() {
   local n="${HPC_NTASKS:-1}"
   if [[ "$n" -gt 1 ]]; then
-    # NOT --oversubscribe. Slurm gives us --cpus-per-task >= ranks, so the node
-    # is not oversubscribed, and that flag makes OpenMPI switch to
-    # yield-when-idle polling: every MPI wait becomes a sched_yield loop instead
-    # of a busy-wait. Measured cost with 2 ranks: ~43ms per timestep, which
-    # turned a 43-second solve into 41 minutes — same dt, same step count, all
-    # of it latency. mpi_yield_when_idle=0 pins the fast path explicitly.
-    #
-    # --bind-to none stays: OpenMPI's default binding collides with the cpuset
-    # Slurm hands us and aborts with hwloc_set_cpubind "Error".
+    # Not --oversubscribe: Slurm gives us --cpus-per-task >= ranks, so the node
+    # is not oversubscribed, and the flag would switch OpenMPI to
+    # yield-when-idle polling. (It is not what caused the 44ms/step stall — that
+    # was OMP_PROC_BIND, see above — but it is still wrong to pass.)
     echo mpirun --bind-to none --mca mpi_yield_when_idle 0 -n "$n" python /app/src/hpc_run.py
   else
     echo python /app/src/hpc_run.py
