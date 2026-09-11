@@ -21,6 +21,20 @@ spec:
           # Cesium ion API is called from the browser), so scope the token to
           # the Google Photorealistic 3D Tiles asset in the ion console.
           env:
+            # Public URLs only — non-secret, so they come from app-config
+            # rather than the Secret. Named individually rather than envFrom:
+            # the frontend is the public-facing pod and must not inherit the
+            # whole ConfigMap's worth of queue names and internal hosts.
+            - name: VITE_API_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: app-config
+                  key: VITE_API_URL
+            - name: VITE_KEYCLOAK_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: app-config
+                  key: VITE_KEYCLOAK_URL
             - name: CESIUM_API_KEY
               valueFrom:
                 secretKeyRef:

@@ -24,7 +24,7 @@ spec:
               --port 5000
               --backend-store-uri sqlite:////data/mlflow.db
               --default-artifact-root s3://mlflow/
-              --allowed-hosts "mlflow.127.0.0.1.nip.io,mlflow.127.0.0.1.nip.io:*,mlflow,mlflow:*,localhost:*,127.0.0.1:*"
+              --allowed-hosts "hidris-mlflow.tail51f978.ts.net,hidris-mlflow.tail51f978.ts.net:*,mlflow.127.0.0.1.nip.io,mlflow.127.0.0.1.nip.io:*,mlflow,mlflow:*,localhost:*,127.0.0.1:*"
           envFrom:
             - configMapRef:
                 name: app-config
@@ -75,3 +75,24 @@ spec:
                 name: mlflow
                 port:
                   number: 80
+---
+# Tailnet ingress. The operator gives this a device of its own and a real
+# Let's Encrypt cert for <name>.tail51f978.ts.net, so no mkcert CA and no
+# /etc/hosts entry is needed to reach it from any tailnet member. The traefik
+# ingress above stays as the local fallback for when the tailnet is unavailable.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: mlflow-ts
+  annotations:
+    tailscale.com/hostname: "hidris-mlflow"
+spec:
+  ingressClassName: tailscale
+  defaultBackend:
+    service:
+      name: mlflow
+      port:
+        number: 80
+  tls:
+    - hosts:
+        - hidris-mlflow

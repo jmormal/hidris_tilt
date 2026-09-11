@@ -21,9 +21,13 @@ spec:
               value: "admin"
             - name: KC_BOOTSTRAP_ADMIN_PASSWORD
               value: "admin"
-            # Tell Keycloak its public URL so issuer/redirects are correct
+            # Tell Keycloak its public URL so issuer/redirects are correct.
+            # This is the issuer baked into every token, so it must match
+            # KC_PUBLIC_URL in config.env (which src/auth.py validates against).
+            # KC_HOSTNAME_STRICT=false below means the nip.io ingress still
+            # answers; it just issues tokens with this issuer either way.
             - name: KC_HOSTNAME
-              value: "https://keycloak.127.0.0.1.nip.io"
+              value: "https://hidris-keycloak.tail51f978.ts.net"
             - name: KC_HOSTNAME_STRICT
               value: "false"
             - name: KC_HTTP_ENABLED
@@ -79,7 +83,7 @@ spec:
   ingressClassName: traefik
   tls:
     - hosts:
-        - api.127.0.0.1.nip.io
+        - keycloak.127.0.0.1.nip.io
       secretName: nip-tls
   rules:
     - host: keycloak.127.0.0.1.nip.io
@@ -92,3 +96,24 @@ spec:
                 name: keycloak
                 port:
                   number: 80
+---
+# Tailnet ingress. The operator gives this a device of its own and a real
+# Let's Encrypt cert for <name>.tail51f978.ts.net, so no mkcert CA and no
+# /etc/hosts entry is needed to reach it from any tailnet member. The traefik
+# ingress above stays as the local fallback for when the tailnet is unavailable.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: keycloak-ts
+  annotations:
+    tailscale.com/hostname: "hidris-keycloak"
+spec:
+  ingressClassName: tailscale
+  defaultBackend:
+    service:
+      name: keycloak
+      port:
+        number: 80
+  tls:
+    - hosts:
+        - hidris-keycloak

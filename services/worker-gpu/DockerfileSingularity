@@ -37,11 +37,34 @@
 ARG NVHPC_TAG=24.7-devel-cuda_multi-ubuntu22.04
 FROM nvcr.io/nvidia/nvhpc:${NVHPC_TAG}
 
-# cc86 = A40 (Ampere). cc89 = Ada, your existing known-good target, retained
-# both as insurance and as the PTX source that JITs onto the 5060.
+# cc80 = A30, cc86 = A40 (both Ampere), cc89 = Ada.
+#
+# ALL THREE ARE REQUIRED, not belt-and-braces. The UPV cluster is heterogeneous:
+# vrhpc1/vrhpc2 carry A40s (cc86) and vrhpc4 an A30 (cc80), and Slurm advertises
+# a bare "gpu:8" with no type, so a job cannot request one card over the other.
+# A binary missing the arch of whichever node it lands on survives import and
+# then dies at the first kernel launch with
+#   Accelerator Fatal Error: Failed to find device function '...'
+#   Rebuild this file with -gpu=cc80 to use NVIDIA Tesla GPU 0
+# which reads like a build misconfiguration rather than a scheduling lottery.
 # Adding architectures is additive: it costs build time and image size, and
 # takes nothing away from what already works.
-ARG GPU_ARCH=cc86,cc89
+ARG GPU_ARCH=cc80,cc86,cc89
+
+# CPU target for the ANUGA C/C++ extensions. THIS IS NOT OPTIONAL TUNING.
+#
+# nvc defaults to -tp=host, i.e. the machine doing the build. This laptop is a
+# Ryzen 7 260 (Zen 5) and has AVX-512; the cluster's A40 nodes are EPYC 7453
+# (Zen 3) and do not. A host-targeted build therefore emits AVX-512 that the
+# compute nodes cannot execute, and `import anuga` dies with SIGILL — exit 132,
+# "Illegal instruction (core dumped)", with no Python traceback to explain it.
+# numpy and scipy are unaffected, being generic pip wheels, which makes the
+# failure look like an ANUGA bug rather than a portability one.
+#
+# zen3 is the cluster's actual microarchitecture and runs on the laptop too
+# (Zen 5 is a superset). Use px for a generic x86-64 build if the cluster ever
+# becomes heterogeneous.
+ARG CPU_ARCH=zen3
 
 ENV DEBIAN_FRONTEND=noninteractive \
     MAX_JOBS=1 \
@@ -75,7 +98,9 @@ RUN git clone --branch develop --depth 1 \
 # Regular install, not -e. meson-python editable installs rebuild on import,
 # which cannot work inside a read-only SIF.
 RUN cd /opt/anuga-src && \
-    CC=nvc CXX=nvc++ pip install --no-cache-dir --no-build-isolation . \
+    CC=nvc CXX=nvc++ \
+    CFLAGS="-tp=${CPU_ARCH}" CXXFLAGS="-tp=${CPU_ARCH}" \
+    pip install --no-cache-dir --no-build-isolation . \
       -Csetup-args=-Dgpu_offload=true \
       -Csetup-args=-Dgpu_arch=${GPU_ARCH}
 
@@ -85,7 +110,8 @@ RUN python -c "from anuga.shallow_water import sw_domain_gpu_ext; print('gpu ext
 
 # Record what was targeted, so a container can be interrogated later.
 ENV ANUGA_BUILT_ARCH=${GPU_ARCH}
-RUN echo "gpu_arch=${GPU_ARCH}" > /opt/build-info.txt
+ENV ANUGA_BUILT_CPU=${CPU_ARCH}
+RUN echo "gpu_arch=${GPU_ARCH} cpu_arch=${CPU_ARCH}" > /opt/build-info.txt
 
 WORKDIR /app
 COPY requirements.txt /app/

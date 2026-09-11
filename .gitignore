@@ -1,8 +1,14 @@
 services/jupyter/
 *.tif
 *.asc
-*.env
-.env
+# Secrets. NOT "*.env" — that would also match config.env, which is meant to be
+# committed and is the one place non-secret shared config lives.
+/.env
+/.env.*
+!/.env.example
+# Singularity's OCI blob cache: tens of GB, regenerable, was tracked by accident.
+/services/worker-gpu/.sing-cache/
+/services/worker-gpu/.sing-tmp/
 /services/worker-gpu/mesh/MDT_malla_5m_etrs89h30
 /services/worker-gpu/mesh/MDT_malla_5m_etrs89h30.ers
 /services/worker-gpu/oldmesh/mi_terreno_whole.tif.aux.xml

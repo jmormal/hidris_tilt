@@ -44,6 +44,11 @@ spec:
           envFrom:
             - configMapRef:
                 name: app-config
+            # HPC_PASSWORD (the login-node password src/remote.py authenticates
+            # to vrhpcadm1 with) is secret, so it arrives via the Secret rather
+            # than app-config. Only this container talks to the HPC.
+            - secretRef:
+                name: app-secrets
           ports:
             - containerPort: 8080
           readinessProbe:
@@ -111,7 +116,7 @@ kind: Ingress
 metadata:
   name: api-ts
   annotations:
-    tailscale.com/hostname: "api"
+    tailscale.com/hostname: "hidris-api"
 spec:
   ingressClassName: tailscale
   defaultBackend:
@@ -121,7 +126,7 @@ spec:
         number: 80
   tls:
     - hosts:
-        - api
+        - hidris-api
 ---
 # Egress: the reverse of the ingresses above. The tailscale operator turns this
 # ExternalName into a proxy StatefulSet in the "tailscale" namespace that

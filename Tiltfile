@@ -23,11 +23,22 @@ def parse_env(text):
         if not line or line.startswith("#") or "=" not in line:
             continue
         k, v = line.split("=", 1)
-        out[k.strip()] = v.strip().strip('"').strip("'")
+        v = v.strip()
+        # Only a MATCHED surrounding pair is quoting; a lone quote is data.
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in ('"', "'"):
+            v = v[1:-1]
+        out[k.strip()] = v
     return out
 
 def env_to_yaml(d):
-    return "".join(['  {}: "{}"\n'.format(k, v) for k, v in d.items()])
+    # Single-quoted YAML, not double: a value containing a " (a password, say)
+    # would otherwise close the scalar early and produce invalid YAML, so the
+    # secret lands truncated or the apply fails outright. In single-quoted YAML
+    # the only escape needed is '' for a literal quote, and backslashes stay
+    # literal — which is what an env value wants.
+    return "".join(
+        ["  {}: '{}'\n".format(k, v.replace("'", "''")) for k, v in d.items()]
+    )
 
 config_vars = parse_env(read_file("./config.env", default=""))
 secret_vars = parse_env(read_file("./.env", default=""))
@@ -80,6 +91,28 @@ kubectl create secret tls nip-tls \
 """,
 )
 
+# ── Public links ──────────────────────────────────────────────────────────────
+# Tilt's per-resource links point at the tailnet, which is the configured path
+# for everything now (see the "Public URLs" block in config.env). The nip.io
+# ingresses still exist as a local fallback, so both are listed — tailnet first,
+# because that is the one that works from anywhere.
+#
+# The tailnet hostname is NOT always the service name: the frontend's device is
+# "hidris-dt". Anything not in this map falls back to "hidris-<name>".
+TAILNET_DOMAIN = config_vars.get("TAILNET_DOMAIN", "")
+TS_HOSTNAMES = {"frontend": "hidris-dt"}
+
+def ts_host(name):
+    return TS_HOSTNAMES.get(name, "hidris-" + name)
+
+def public_links(name, label=None):
+    label = label or name
+    out = []
+    if TAILNET_DOMAIN:
+        out.append(link("https://" + ts_host(name) + "." + TAILNET_DOMAIN, label + " (tailnet)"))
+    out.append(link("https://" + name + ".127.0.0.1.nip.io", label + " (local)"))
+    return out
+
 # ── Helper: build + deploy one service ────────────────────────────────────────
 def service_js(name, port):
     docker_build(
@@ -99,7 +132,7 @@ def service_js(name, port):
     k8s_resource(
         name,
         resource_deps=["nip-tls"],
-        links=[link("https://" + name + ".127.0.0.1.nip.io", name)],
+        links=public_links(name),
     )
 
 # ── Helper: build + deploy one service ────────────────────────────────────────
@@ -120,7 +153,7 @@ def service_python(name, port):
     k8s_resource(
         name,
         resource_deps=["nip-tls"],
-        links=[link("https://" + name + ".127.0.0.1.nip.io", name)],
+        links=public_links(name),
     )
 
 # ── Helper: build a worker image (used by KEDA ScaledJobs) ────────────────────
@@ -160,7 +193,7 @@ k8s_resource(
     workload="jupyter",
     new_name="jupyter",
     resource_deps=["nip-tls"],
-    links=[link("https://jupyter.127.0.0.1.nip.io", "jupyter")],
+    links=public_links("jupyter"),
 )
 
 # ── Workers ───────────────────────────────────────────────────────────────────
@@ -174,9 +207,9 @@ worker_build("worker-gpu", "./services/worker-gpu", live_pip=False)
 worker_build("worker-kpi", "./services/worker-kpi")
 
 # ── Infra (prebuilt images) ───────────────────────────────────────────────────
-service_image("minio", links=[link("https://minio.127.0.0.1.nip.io", "minio console")], resource_deps=["nip-tls"])
+service_image("minio", links=public_links("minio", "minio console"), resource_deps=["nip-tls"])
 service_image("redis")
-service_image("mlflow", links=[link("https://mlflow.127.0.0.1.nip.io", "mlflow")], resource_deps=["nip-tls"])
+service_image("mlflow", links=public_links("mlflow"), resource_deps=["nip-tls"])
 
 # ── KEDA (cluster-wide autoscaler operator) ───────────────────────────────────
 # KEDA is an operator, not a single Deployment — install it via Helm, then
@@ -213,7 +246,19 @@ k8s_resource(
 
 # in Tiltfile, alongside service_image("redis") etc.
 k8s_yaml("./k8s/keycloak-realm.yaml")   # ConfigMap first
-service_image("keycloak", links=[link("https://keycloak.127.0.0.1.nip.io", "keycloak")], resource_deps=["nip-tls", "keycloak-db"])
+service_image("keycloak", links=public_links("keycloak"), resource_deps=["nip-tls", "keycloak-db"])
+
+# `start-dev --import-realm` only imports a realm that does not already exist,
+# and the realm lives in the keycloak Postgres, which outlives `tilt down`. So
+# editing k8s/keycloak-realm.yaml has no effect on a stack that has run once —
+# the redirect URIs silently stay at whatever they were the day the realm was
+# created. This pushes them, idempotently, on every keycloak restart.
+local_resource(
+    "keycloak-realm-sync",
+    cmd="./keycloak-sync.sh",
+    deps=["./k8s/keycloak-realm.yaml", "./keycloak-sync.sh"],
+    resource_deps=["keycloak"],
+)
 
 
 # ── CloudNativePG (Postgres Operator) ─────────────────────────────────────────
@@ -267,7 +312,7 @@ kubectl create secret generic pgadmin-pgpass \
 k8s_resource(
     "pgadmin",
     resource_deps=["pgadmin-pgpass", "nip-tls"],
-    links=[link("https://pgadmin.127.0.0.1.nip.io", "pgadmin")],
+    links=public_links("pgadmin"),
 )
 
 

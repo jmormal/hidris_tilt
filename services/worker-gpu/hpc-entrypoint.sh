@@ -75,8 +75,15 @@ TS_PID=$!
 trap 'tailscale --socket="$SOCKET" down >/dev/null 2>&1 || true; kill "$TS_PID" 2>/dev/null' EXIT
 
 for _ in $(seq 1 30); do [[ -S "$SOCKET" ]] && break; sleep 1; done
-UP_ARGS=(--hostname="${TS_HOSTNAME:-hidris-worker-$(hostname -s)}" --accept-routes --accept-dns=false)
+# --reset for the same reason as netns-run.sh: the two transports share a state
+# dir but disagree about --accept-dns, and without it whichever ran first makes
+# the other refuse to start.
+UP_ARGS=(--reset --hostname="${TS_HOSTNAME:-hidris-worker-$(hostname -s)}" --accept-routes --accept-dns=false)
 [[ -n "${TS_TAGS:-}" ]] && UP_ARGS+=(--advertise-tags="$TS_TAGS")
-tailscale --socket="$SOCKET" up --authkey="${TS_AUTHKEY:?}" "${UP_ARGS[@]}" >&2 || exit 5
+if ! up_err=$(tailscale --socket="$SOCKET" up --authkey="${TS_AUTHKEY:?}" "${UP_ARGS[@]}" 2>&1); then
+  # Never let the key into a Slurm .out file — see netns-run.sh.
+  printf '%s\n' "$up_err" | sed -e 's/tskey-[A-Za-z0-9-]*/tskey-<redacted>/g' >&2
+  exit 5
+fi
 
 exec proxychains4 -f /etc/proxychains4.conf -q python /app/src/hpc_run.py

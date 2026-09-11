@@ -56,10 +56,22 @@ trap cleanup EXIT INT TERM
 for _ in $(seq 1 30); do [[ -S "$SOCKET" ]] && break; sleep 1; done
 [[ -S "$SOCKET" ]] || { echo "netns: tailscaled socket never appeared" >&2; tail -30 "$TSLOG" >&2; exit 4; }
 
-UP_ARGS=(--hostname="${TS_HOSTNAME:-hidris-worker-$(hostname -s)}" --accept-routes)
+# --reset is load-bearing, not defensive. The state dir is shared with the
+# proxychains fallback in hpc-entrypoint.sh, which brings tailscale up with
+# --accept-dns=false; this path does not, because it manages resolv.conf
+# itself. Without --reset, `tailscale up` sees the stored prefs disagree and
+# refuses outright ("changing settings via 'tailscale up' requires mentioning
+# all"), so one fallback run poisons every later netns run on that node.
+UP_ARGS=(--reset --hostname="${TS_HOSTNAME:-hidris-worker-$(hostname -s)}" --accept-routes)
 [[ -n "${TS_TAGS:-}" ]] && UP_ARGS+=(--advertise-tags="$TS_TAGS")
-if ! tailscale --socket="$SOCKET" up --authkey="${TS_AUTHKEY:?}" "${UP_ARGS[@]}" >&2; then
-  echo "netns: tailscale up failed" >&2; tail -30 "$TSLOG" >&2; exit 5
+# The auth key must not reach the log: these Slurm .out files land in a shared
+# home on the cluster, and `tailscale up` echoes the full command line back on
+# failure. Capture and filter rather than letting it through.
+if ! up_err=$(tailscale --socket="$SOCKET" up --authkey="${TS_AUTHKEY:?}" "${UP_ARGS[@]}" 2>&1); then
+  echo "netns: tailscale up failed" >&2
+  printf '%s\n' "$up_err" | sed -e 's/tskey-[A-Za-z0-9-]*/tskey-<redacted>/g' >&2
+  sed -e 's/tskey-[A-Za-z0-9-]*/tskey-<redacted>/g' "$TSLOG" | tail -30 >&2
+  exit 5
 fi
 
 # The search domain is what makes a BARE name like "hidris-db" resolve. Without

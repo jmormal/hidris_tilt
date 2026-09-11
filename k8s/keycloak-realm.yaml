@@ -14,6 +14,9 @@ data:
           "publicClient": true,
           "standardFlowEnabled": true,
           "redirectUris": [
+            "https://hidris-dt.tail51f978.ts.net/*",
+            "https://hidris-api.tail51f978.ts.net/docs/oauth2-redirect",
+            "https://hidris-keycloak.tail51f978.ts.net/*",
             "https://frontend.127.0.0.1.nip.io/*",
             "http://frontend.127.0.0.1.nip.io/*",
             "http://localhost:3000/*",
@@ -21,6 +24,9 @@ data:
             "http://localhost:8000/docs/oauth2-redirect"
           ],
           "webOrigins": [
+            "https://hidris-dt.tail51f978.ts.net",
+            "https://hidris-api.tail51f978.ts.net",
+            "https://hidris-keycloak.tail51f978.ts.net",
             "https://frontend.127.0.0.1.nip.io",
             "http://frontend.127.0.0.1.nip.io",
             "http://localhost:3000",

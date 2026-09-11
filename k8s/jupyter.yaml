@@ -56,3 +56,24 @@ spec:
                 name: jupyter
                 port:
                   number: 80
+---
+# Tailnet ingress. The operator gives this a device of its own and a real
+# Let's Encrypt cert for <name>.tail51f978.ts.net, so no mkcert CA and no
+# /etc/hosts entry is needed to reach it from any tailnet member. The traefik
+# ingress above stays as the local fallback for when the tailnet is unavailable.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: jupyter-ts
+  annotations:
+    tailscale.com/hostname: "hidris-jupyter"
+spec:
+  ingressClassName: tailscale
+  defaultBackend:
+    service:
+      name: jupyter
+      port:
+        number: 80
+  tls:
+    - hosts:
+        - hidris-jupyter

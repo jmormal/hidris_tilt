@@ -74,3 +74,24 @@ spec:
                 name: minio
                 port:
                   number: 9001
+---
+# Tailnet ingress. The operator gives this a device of its own and a real
+# Let's Encrypt cert for <name>.tail51f978.ts.net, so no mkcert CA and no
+# /etc/hosts entry is needed to reach it from any tailnet member. The traefik
+# ingress above stays as the local fallback for when the tailnet is unavailable.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: minio-ts
+  annotations:
+    tailscale.com/hostname: "hidris-minio"
+spec:
+  ingressClassName: tailscale
+  defaultBackend:
+    service:
+      name: minio
+      port:
+        number: 9001
+  tls:
+    - hosts:
+        - hidris-minio
