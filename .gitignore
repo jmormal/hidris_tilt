@@ -14,3 +14,8 @@ services/jupyter/
 /services/worker-gpu/oldmesh/mi_terreno_whole.tif.aux.xml
 */__pycache__/*
 /services/worker-gpu/src/__pycache__
+# Filled-in local env files for the worker — these carry PG_PASSWORD and
+# TS_AUTHKEY. Only worker.env.example (placeholders) belongs in the repo.
+/services/worker-gpu/anuga.env
+/services/worker-gpu/local.env
+/services/worker-gpu/worker.env
