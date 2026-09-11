@@ -31,6 +31,16 @@ spec:
       # raster tile work is binary-heavy; give queries room
       work_mem: "128MB"
       shared_buffers: "256MB"
+      # Reap backends whose client vanished. An HPC job cancelled mid
+      # get_storm_cube() leaves a backend blocked in lo_read writing to a dead
+      # TCP peer; it holds its lock on `storms`, so the API's init_storms()
+      # migration cannot take ACCESS EXCLUSIVE and every api pod then hangs
+      # forever at "Waiting for application startup" — a failure that looks
+      # nothing like its cause. Postgres defaults to the kernel's ~2h keepalive;
+      # this detects the dead peer in about two minutes.
+      tcp_keepalives_idle: "60"
+      tcp_keepalives_interval: "10"
+      tcp_keepalives_count: "6"
   bootstrap:
     initdb:
       database: hidris
