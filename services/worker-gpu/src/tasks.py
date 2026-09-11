@@ -409,6 +409,88 @@ def _build_vertices(domain, dst_epsg, src_epsg):
     ).astype(np.float64)
 
 
+def _parallel_setup(domain):
+    """Partition `domain` across MPI ranks, returning what the gather needs.
+
+    A no-op with one rank: anuga.distribute() returns the domain untouched, so
+    the in-cluster (KEDA) path and a hand-run single-GPU job take exactly the
+    same code path they always did.
+
+    Imported lazily. anuga.parallel pulls in mpi4py, and the k8s worker has no
+    reason to initialise MPI just to import this module.
+    """
+    from anuga import distribute, myid, numprocs
+
+    if numprocs == 1:
+        return {"domain": domain, "parallel": False, "myid": 0, "numprocs": 1}
+
+    domain = distribute(domain)
+
+    from mpi4py import MPI
+
+    comm = MPI.COMM_WORLD
+    # Ghost cells are duplicated on a neighbour; only OWNED cells are gathered,
+    # or the overlap would be written twice and the counts would not add up to
+    # the global triangle count.
+    owned = np.asarray(domain.tri_full_flag) == 1
+    gids = np.asarray(domain.tri_l2g, dtype=np.int64)[owned]
+
+    counts = np.array(comm.allgather(gids.size), dtype=np.int64)
+    displs = np.concatenate(([0], np.cumsum(counts)[:-1]))
+    all_gids = np.empty(int(counts.sum()), dtype=np.int64) if myid == 0 else None
+    comm.Gatherv(
+        gids, (all_gids, counts, displs, MPI.INT64_T) if myid == 0 else None, root=0
+    )
+
+    return {
+        "domain": domain,
+        "parallel": True,
+        "myid": myid,
+        "numprocs": numprocs,
+        "comm": comm,
+        "MPI": MPI,
+        "owned": owned,
+        "counts": counts,
+        "displs": displs,
+        "all_gids": all_gids,
+        "n_global": int(counts.sum()),
+        "recv": np.empty(int(counts.sum()), dtype=np.float32) if myid == 0 else None,
+    }
+
+
+def _snapshot_parallel(snapshots, domain, t, par):
+    """One frame, reassembled on rank 0 from every rank's owned cells.
+
+    Gatherv rather than comm.gather: the latter pickles, and at ~7MB per array
+    per frame across a thousand frames that overhead is the difference between
+    a gather that disappears into the solve and one that dominates it.
+
+    Only rank 0 accumulates, so peak memory is unchanged from the serial path —
+    it is the same global arrays, just assembled from pieces.
+    """
+    MPI = par["MPI"]
+    comm, owned, myid = par["comm"], par["owned"], par["myid"]
+    q = domain.quantities
+    frame = []
+    for name in ("stage", "xmomentum", "ymomentum"):
+        send = np.ascontiguousarray(
+            np.asarray(q[name].centroid_values, dtype=np.float32)[owned]
+        )
+        comm.Gatherv(
+            send,
+            (par["recv"], par["counts"], par["displs"], MPI.FLOAT)
+            if myid == 0
+            else None,
+            root=0,
+        )
+        if myid == 0:
+            glob = np.empty(par["n_global"], dtype=np.float32)
+            glob[par["all_gids"]] = par["recv"]
+            frame.append(glob)
+    if myid == 0:
+        snapshots.append((float(t), frame[0], frame[1], frame[2]))
+
+
 def _snapshot(snapshots, domain, t):
     """Per-yieldstep capture: 3 float32 copies, no Python per-triangle work.
 
@@ -706,11 +788,68 @@ def _run_gpu_worker(args, payload=None):
     else:
         domain.set_quantity("stage", initial_stage, location="centroids")
 
-    domain.set_minimum_allowed_height(0.01)  # Ignore tiny puddles
+    # ---- Boundaries (GPU-native types only -> keeps the fused C RK loop) ----
+    print(f" interior holes{interior_holes}")
 
+    B = []
+    print(features)
+    B = []
+    for elevation_feat in features.get("elevation", []):
+        coords_abs = elevation_feat["_coords_proj"]
+        coords_rel = [[x - xllcorner, y - yllcorner] for x, y in coords_abs]
+        value = elevation_feat["properties"]["elevation"]
+        B.append((coords_rel, value))
+
+    if B:
+        domain.add_quantity(
+            "elevation",
+            Polygon_function(B, default=0.0),
+            location="centroids",
+        )
+    # ---- Static per-triangle data (captured ONCE) ----
+    vertices = _build_vertices(domain, dst_epsg=dst_epsg, src_epsg=src_epsg)
+    tri_indices = np.asarray(domain.mesh.triangles, dtype=np.int64)
+    elev = np.array(domain.quantities["elevation"].centroid_values, dtype=np.float32)
+    friction = np.array(domain.quantities["friction"].centroid_values, dtype=np.float32)
+    _publish_progress(args.job_id, 0, "Building domain")
+
+    # ---- Partition across MPI ranks (no-op when running on one) -------------
+    # ANUGA puts one GPU on each rank (gpu_domain_init: device_id = rank %
+    # num_devices), so N GPUs means N ranks and nothing else does.
+    #
+    # This sits exactly here for two reasons. Everything above is global and
+    # has to be captured BEFORE partitioning — vertices, triangle indices,
+    # elevation and friction describe the whole mesh, and after distribute()
+    # each rank only sees its own slice. Everything below is the operators,
+    # which distribute() does NOT carry: it transfers points, vertices,
+    # boundary, quantities and the boundary map, and nothing else. An operator
+    # created before this line would simply vanish on every rank.
+    #
+    # On ranks other than 0 the domain built above is thrown away — distribute
+    # only reads its argument on rank 0. That wastes a mesh build per extra
+    # rank; it is concurrent so it costs wall-clock nothing, and it keeps this
+    # a small change to a function the in-cluster path also depends on.
+    _par = _parallel_setup(domain)
+    domain = _par["domain"]
+
+    # Evolve settings must be re-applied AFTER distribute for the same reason
+    # as the boundaries: distribute() transfers quantities and the boundary map,
+    # not solver configuration, so a parallel domain silently reverts to anuga's
+    # default 1000s cap. Measured: the serial run held dt <= 5s while the 2-rank
+    # run opened with dt in [96, 1000] — a different trajectory through the
+    # cold start, from the same inputs.
+    domain.set_minimum_allowed_height(0.01)  # Ignore tiny puddles
     domain.set_maximum_allowed_speed(20.0)  # Cap water speed at 20 m/s
     domain.set_evolve_max_timestep(5.0)  # cap the cold-start step
-    # ---- Boundaries (GPU-native types only -> keeps the fused C RK loop) ----
+
+    # ---- Boundaries (AFTER distribute) -------------------------------------
+    # Ordering matters and matches anuga's own parallel test
+    # (anuga/parallel/tests/run_parallel_distribute_domain.py): set_quantity
+    # before distribute, set_boundary after. Every boundary object is
+    # constructed with a reference to `domain` — Reflective_boundary(domain) —
+    # so building them before partitioning would bind them to the sequential
+    # domain that distribute() then replaces, leaving each rank evaluating its
+    # boundaries against a mesh it no longer owns.
     bc_factory = {
         "reflective": lambda: anuga.Reflective_boundary(domain),
         "transmissive": lambda: (
@@ -720,7 +859,6 @@ def _run_gpu_worker(args, payload=None):
         ),
     }
     boundries = {tag: bc_factory[tag]() for tag in boundary_tags}
-    print(f" interior holes{interior_holes}")
     if len(interior_holes) > 0:
         boundries["interior"] = bc_factory["reflective"]()
     domain.set_boundary(boundries)
@@ -783,40 +921,36 @@ def _run_gpu_worker(args, payload=None):
             # stage. See storm_sampler.py's module docstring.
             storm_sampler.StormRateOperator(domain, driver)
 
-    B = []
-    print(features)
-    B = []
-    for elevation_feat in features.get("elevation", []):
-        coords_abs = elevation_feat["_coords_proj"]
-        coords_rel = [[x - xllcorner, y - yllcorner] for x, y in coords_abs]
-        value = elevation_feat["properties"]["elevation"]
-        B.append((coords_rel, value))
-
-    if B:
-        domain.add_quantity(
-            "elevation",
-            Polygon_function(B, default=0.0),
-            location="centroids",
-        )
-    # ---- Static per-triangle data (captured ONCE) ----
-    vertices = _build_vertices(domain, dst_epsg=dst_epsg, src_epsg=src_epsg)
-    tri_indices = np.asarray(domain.mesh.triangles, dtype=np.int64)
-    elev = np.array(domain.quantities["elevation"].centroid_values, dtype=np.float32)
-    friction = np.array(domain.quantities["friction"].centroid_values, dtype=np.float32)
-    _publish_progress(args.job_id, 0, "Building domain")
-
     # ---- Enable GPU acceleration (after boundaries/operators exist) ----
     print(f"[tasks:gpu] enabling GPU mode {args.gpu_mode}")
     domain.set_multiprocessor_mode(args.gpu_mode)
 
     # ---- Evolve ----
     snapshots = []
+    _is_root = _par["myid"] == 0
     for t in domain.evolve(yieldstep=yieldstep, duration=duration):
-        domain.print_timestepping_statistics()
-        _snapshot(snapshots, domain, t)
-        _publish_progress(args.job_id, round(t / duration * 100, 1), f"t={t}")
+        if _is_root:
+            domain.print_timestepping_statistics()
+        if _par["parallel"]:
+            _snapshot_parallel(snapshots, domain, t, _par)
+        else:
+            _snapshot(snapshots, domain, t)
+        # One progress stream, not N identical ones racing on the same channel.
+        if _is_root:
+            _publish_progress(args.job_id, round(t / duration * 100, 1), f"t={t}")
 
     # ---- Post-process once, vectorized ----
+    # Only rank 0 holds the assembled snapshots, so only rank 0 can build the
+    # result. The others have finished their share of the solve and return
+    # None; hpc_run.py exits them quietly. They must NOT touch Postgres or
+    # Redis — N ranks writing one solution would race over the same row.
+    if _par["parallel"] and _par["myid"] != 0:
+        from anuga import barrier, finalize
+
+        barrier()
+        finalize()
+        return None
+
     print("building result (vectorized)")
     result = _finalize_result(
         snapshots,
@@ -845,6 +979,13 @@ def _run_gpu_worker(args, payload=None):
         print(f"[tasks:gpu] wrote result to {args.result}")
 
     print("done")
+    if _par["parallel"]:
+        # Rank 0 waits for the others before finalizing MPI, so a rank cannot
+        # tear down the communicator while another is still in the barrier.
+        from anuga import barrier, finalize
+
+        barrier()
+        finalize()
     return gz
 
 

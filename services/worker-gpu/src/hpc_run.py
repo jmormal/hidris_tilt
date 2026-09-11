@@ -30,6 +30,14 @@ PUBLIC_ID = os.environ["PUBLIC_ID"]
 JOB_ID = os.environ["JOB_ID"]
 REDIS_URL = os.getenv("REDIS_URL", "redis://hidris-redis:6379")
 
+# Rank identity, resolved once. anuga defines these even without MPI (0 and 1),
+# so this file behaves identically whether it was started by mpirun or not.
+try:
+    from anuga import myid as _MYID, numprocs as _NUMPROCS
+except Exception:  # noqa: BLE001
+    _MYID, _NUMPROCS = 0, 1
+_IS_ROOT = _MYID == 0
+
 
 def publish(event: str, data: dict) -> None:
     """Best-effort: a failed progress publish must never kill the simulation.
@@ -37,6 +45,8 @@ def publish(event: str, data: dict) -> None:
     The result goes to Postgres, not down this channel, so losing an event
     costs a UI update and nothing else.
     """
+    if not _IS_ROOT:
+        return
     try:
         Redis.from_url(REDIS_URL).publish(channel_for(JOB_ID), encode(event, data))
     except Exception as exc:  # noqa: BLE001
@@ -56,17 +66,29 @@ def prepare_workdir() -> str:
     keeps every intermediate on the node's scratch rather than in the image.
     """
     workdir = os.getenv("HPC_WORKDIR", "/scratch")
+    if _NUMPROCS > 1:
+        # A directory per rank. Two things go wrong when ranks share one:
+        # they race to create the src symlink (FileExistsError, because
+        # lexists-then-symlink is not atomic), and every rank writes the DEM
+        # clip to the same relative "region.asc" at the same time, which is a
+        # silently corrupted raster rather than an error.
+        workdir = os.path.join(workdir, f"rank{_MYID}")
     os.makedirs(workdir, exist_ok=True)
     link = os.path.join(workdir, "src")
-    if not os.path.lexists(link):
+    try:
         os.symlink("/app/src", link)
+    except FileExistsError:
+        pass
     os.chdir(workdir)
-    print(f"[hpc_run] cwd={workdir} (src -> /app/src)")
+    print(f"[hpc_run] rank {_MYID}: cwd={workdir} (src -> /app/src)")
     return workdir
 
 
 def main() -> int:
-    print(f"[hpc_run] instance={PUBLIC_ID} job={JOB_ID} host={os.uname().nodename}")
+    print(
+        f"[hpc_run] instance={PUBLIC_ID} job={JOB_ID} host={os.uname().nodename} "
+        f"rank={_MYID}/{_NUMPROCS}"
+    )
     prepare_workdir()
     publish("queued", {"job_id": JOB_ID, "public_id": PUBLIC_ID,
                        "detail": f"Started on {os.uname().nodename}"})
@@ -110,12 +132,23 @@ def main() -> int:
         gz_bytes = tasks._run_gpu_worker(args, payload=payload)
     except Exception as exc:  # noqa: BLE001
         traceback.print_exc()
-        publish("error", {"detail": f"Simulation failed: {exc}"})
+        if _IS_ROOT:
+            publish("error", {"detail": f"Simulation failed: {exc}"})
         return 1
+
+    # Under mpirun every rank runs this file. Only rank 0 comes back with the
+    # result; the rest have done their share of the solve and must not write it
+    # — N ranks storing one solution would race on the same row, and N ranks
+    # publishing would give the frontend N copies of every event.
+    if gz_bytes is None:
+        print(f"[hpc_run] rank {_MYID}: solve done, rank 0 stores the result")
+        return 0
 
     # Write to shared scratch BEFORE the DB. A three-hour simulation whose
     # upload fails on a dropped tailnet connection must not lose its result —
     # this file is what makes the run replayable instead of wasted.
+    # Deliberately the shared workdir, not the per-rank cwd: this is the
+    # replayable artifact run-simulation.slurm lists after the job.
     spool = os.path.join(os.getenv("HPC_WORKDIR", "/scratch"),
                          f"solution-{PUBLIC_ID}.bin.gz")
     try:

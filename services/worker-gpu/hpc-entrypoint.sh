@@ -18,9 +18,36 @@ mkdir -p "$WORKDIR"
 : "${PUBLIC_ID:?PUBLIC_ID is unset}"
 : "${JOB_ID:?JOB_ID is unset}"
 
+# How the solver is launched. HPC_NTASKS>1 puts one MPI rank on each GPU —
+# ANUGA assigns devices round-robin by rank (gpu_domain_init: rank % ndevices),
+# so ranks are the only way to use more than one card.
+#
+# mpirun INSIDE the container, not srun outside it: Slurm's PMI does not reach
+# the container's OpenMPI, and two srun tasks each come up as an independent
+# 1-rank world (numprocs=1 twice, one GPU idle). --bind-to none because
+# OpenMPI's default binding collides with the cpuset Slurm hands us and dies
+# with hwloc_set_cpubind "Error".
+solver_cmd() {
+  local n="${HPC_NTASKS:-1}"
+  if [[ "$n" -gt 1 ]]; then
+    # NOT --oversubscribe. Slurm gives us --cpus-per-task >= ranks, so the node
+    # is not oversubscribed, and that flag makes OpenMPI switch to
+    # yield-when-idle polling: every MPI wait becomes a sched_yield loop instead
+    # of a busy-wait. Measured cost with 2 ranks: ~43ms per timestep, which
+    # turned a 43-second solve into 41 minutes — same dt, same step count, all
+    # of it latency. mpi_yield_when_idle=0 pins the fast path explicitly.
+    #
+    # --bind-to none stays: OpenMPI's default binding collides with the cpuset
+    # Slurm hands us and aborts with hwloc_set_cpubind "Error".
+    echo mpirun --bind-to none --mca mpi_yield_when_idle 0 -n "$n" python /app/src/hpc_run.py
+  else
+    echo python /app/src/hpc_run.py
+  fi
+}
+
 run_direct() {
   echo "==> no tailnet requested (HPC_NO_TAILNET=1); running against \$DB_HOST as-is" >&2
-  python /app/src/hpc_run.py
+  $(solver_cmd)
 }
 
 run_netns() {
@@ -28,7 +55,7 @@ run_netns() {
   rm -f "$fifo"; mkfifo "$fifo" || return 1
 
   unshare --user --map-root-user --net --mount \
-    /opt/hpc/netns-run.sh "$fifo" "$WORKDIR" python /app/src/hpc_run.py &
+    /opt/hpc/netns-run.sh "$fifo" "$WORKDIR" $(solver_cmd) &
   local nspid=$!
 
   slirp4netns --configure --mtu=65520 --disable-host-loopback \
@@ -86,4 +113,4 @@ if ! up_err=$(tailscale --socket="$SOCKET" up --authkey="${TS_AUTHKEY:?}" "${UP_
   exit 5
 fi
 
-exec proxychains4 -f /etc/proxychains4.conf -q python /app/src/hpc_run.py
+exec proxychains4 -f /etc/proxychains4.conf -q $(solver_cmd)

@@ -1,6 +1,8 @@
 #!/bin/bash
 #SBATCH --job-name=hidris-sim
 #SBATCH --gres=gpu:1
+# One MPI rank per GPU. The API overrides --gres from the UI; HPC_NTASKS has to
+# follow it, which is what the SLURM_GPUS_ON_NODE fallback below is for.
 #SBATCH --cpus-per-task=4
 # Memory is sized for the RESULT, not the solve. The solve itself is modest
 # (~10GB for a 1.8M-triangle domain), but _snapshot keeps three float32 arrays
@@ -55,6 +57,12 @@ NETNS_OVERRIDE="$CONTAINERS/netns-run-worker.sh"
 # Remove once DockerfileSingularity's CPU_ARCH=zen3 build has been baked into
 # a fresh SIF.
 ANUGA_OVERRIDE=$(ls -d "$CONTAINERS"/anuga-zen3/extracted/anuga 2>/dev/null | head -1)
+# Worker sources, same reason as the transport scripts: a change to tasks.py or
+# hpc_run.py should not cost a 16GB rebuild and re-upload. Bound per FILE, not
+# as a directory — /app/src also holds the 13GB DEM, and binding the directory
+# would hide it.
+SRC_OVERRIDE="$CONTAINERS/src-override"
+[[ -d "$SRC_OVERRIDE" ]] || SRC_OVERRIDE=""
 if [[ -z "$ANUGA_OVERRIDE" ]]; then
   # Say so rather than falling back silently: without the override the image's
   # own AVX-512 build runs and dies with SIGILL, which looks like a fresh
@@ -88,6 +96,12 @@ done
 # logs must not be world-readable.
 chmod 600 "$CONTAINERS/hidris-sim-${SLURM_JOB_ID}.out" 2>/dev/null || true
 
+# One rank per allocated GPU. SLURM_GPUS_ON_NODE reflects whatever --gres the
+# submitter actually asked for, so this follows the UI's GPU selector without
+# the API having to pass a second, redundant number that could disagree with it.
+NTASKS="${HPC_NTASKS:-${SLURM_GPUS_ON_NODE:-1}}"
+echo "ranks=$NTASKS (gpus on node=${SLURM_GPUS_ON_NODE:-unset})"
+
 echo "host=$(hostname) job=$SLURM_JOB_ID instance=$PUBLIC_ID stream=$JOB_ID"
 nvidia-smi --query-gpu=name,compute_cap,driver_version --format=csv,noheader 2>/dev/null || true
 
@@ -103,13 +117,15 @@ singularity run \
   --nv \
   --cleanenv \
   --env-file "$ENVFILE" \
-  --env "PUBLIC_ID=${PUBLIC_ID},JOB_ID=${JOB_ID},HPC_WORKDIR=/scratch,HPC_STATEDIR=/ts-state,SLURM_JOB_ID=${SLURM_JOB_ID},PGPASSFILE=/pgpass" \
+  --env "PUBLIC_ID=${PUBLIC_ID},JOB_ID=${JOB_ID},HPC_WORKDIR=/scratch,HPC_STATEDIR=/ts-state,SLURM_JOB_ID=${SLURM_JOB_ID},PGPASSFILE=/pgpass,HPC_NTASKS=${NTASKS}" \
   -B "$WORKDIR:/scratch" \
   -B "$STATEROOT:/ts-state" \
   -B "$PGPASS:/pgpass:ro" \
   ${ENTRYPOINT_OVERRIDE:+-B "$ENTRYPOINT_OVERRIDE:/opt/hpc/entrypoint.sh:ro"} \
   ${NETNS_OVERRIDE:+-B "$NETNS_OVERRIDE:/opt/hpc/netns-run.sh:ro"} \
   ${ANUGA_OVERRIDE:+-B "$ANUGA_OVERRIDE:/usr/local/lib/python3.10/dist-packages/anuga:ro"} \
+  ${SRC_OVERRIDE:+-B "$SRC_OVERRIDE/tasks.py:/app/src/tasks.py:ro"} \
+  ${SRC_OVERRIDE:+-B "$SRC_OVERRIDE/hpc_run.py:/app/src/hpc_run.py:ro"} \
   "$SIF"
 rc=$?
 
