@@ -1,4 +1,5 @@
 import os
+import threading
 import json
 import gzip
 import io
@@ -9,20 +10,35 @@ import psycopg2
 from psycopg2.extras import RealDictCursor, Json
 from psycopg2.pool import ThreadedConnectionPool
 
-_pool = ThreadedConnectionPool(
-    minconn=1,
-    maxconn=10,
-    host=os.getenv("DB_HOST"),
-    dbname=os.getenv("DB_NAME"),
-    user=os.getenv("PG_USER"),
-    password=os.getenv("PG_PASSWORD"),
-    port=os.getenv("DB_PORT", "5432"),
-)
+# Built on first use, NOT at import. Under multi-node MPI only rank 0 has a
+# route to Postgres — the other ranks have no tailnet at all, by design, since
+# they never touch the database. An eager pool here would make `import db` hang
+# or fail on every rank but one, at import time, with a traceback pointing at
+# this module rather than at the missing route.
+_pool = None
+_pool_lock = threading.Lock()
+
+
+def _get_pool():
+    global _pool
+    if _pool is None:
+        with _pool_lock:
+            if _pool is None:  # re-check: another thread may have won the race
+                _pool = ThreadedConnectionPool(
+                    minconn=1,
+                    maxconn=10,
+                    host=os.getenv("DB_HOST"),
+                    dbname=os.getenv("DB_NAME"),
+                    user=os.getenv("PG_USER"),
+                    password=os.getenv("PG_PASSWORD"),
+                    port=os.getenv("DB_PORT", "5432"),
+                )
+    return _pool
 
 
 @contextmanager
 def get_conn():
-    conn = _pool.getconn()
+    conn = _get_pool().getconn()
     broken = False
     try:
         yield conn
@@ -33,7 +49,7 @@ def get_conn():
         broken = True
         raise
     finally:
-        _pool.putconn(conn, close=broken)
+        _get_pool().putconn(conn, close=broken)
 
 
 def init_db():

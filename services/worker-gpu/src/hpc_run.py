@@ -17,6 +17,7 @@ Env: PUBLIC_ID, JOB_ID, plus the DB_*/REDIS_URL that db.py and tasks.py read.
 
 import argparse
 import os
+import json
 import sys
 import traceback
 
@@ -48,9 +49,43 @@ def publish(event: str, data: dict) -> None:
     if not _IS_ROOT:
         return
     try:
-        Redis.from_url(REDIS_URL).publish(channel_for(JOB_ID), encode(event, data))
+        if _DB_PROXY_CONF:
+            import base64
+
+            _proxied("publish", REDIS_URL, channel_for(JOB_ID),
+                     base64.b64encode(encode(event, data)).decode())
+        else:
+            Redis.from_url(REDIS_URL).publish(
+                channel_for(JOB_ID), encode(event, data)
+            )
     except Exception as exc:  # noqa: BLE001
         print(f"[hpc_run] progress publish failed: {exc}", file=sys.stderr)
+
+
+# Set by mn-entrypoint.sh on rank 0 under multi-node: the path to a proxychains
+# config that reaches the tailnet. Its presence means "this rank has DB access,
+# but only through a subprocess" — the solver itself must never be proxied,
+# because LD_PRELOAD breaks MPI (MPI_ERR_INTERN inside bcast).
+_DB_PROXY_CONF = os.getenv("HPC_DB_PROXY_CONF", "")
+
+
+def _proxied(*args: str) -> dict:
+    """Run one db_proxy.py command under proxychains and return its JSON."""
+    import subprocess
+
+    cmd = ["python", "/app/src/db_proxy.py", *args]
+    if _DB_PROXY_CONF:
+        cmd = ["proxychains4", "-f", _DB_PROXY_CONF, "-q"] + cmd
+    out = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+    if out.returncode != 0 or not out.stdout.strip():
+        raise RuntimeError(
+            f"db_proxy {args[0]} failed (rc={out.returncode}): "
+            f"{(out.stderr or out.stdout)[-400:]}"
+        )
+    res = json.loads(out.stdout.strip().splitlines()[-1])
+    if "error" in res:
+        raise RuntimeError(f"db_proxy {args[0]}: {res['error']}")
+    return res
 
 
 def _abort_peers() -> None:
@@ -119,7 +154,21 @@ def main() -> int:
     publish("queued", {"job_id": JOB_ID, "public_id": PUBLIC_ID,
                        "detail": f"Started on {os.uname().nodename}"})
 
-    row = db.get_instance_by_public_id(PUBLIC_ID)
+    # Rank 0 reads it and hands it to the others. Under multi-node only rank 0
+    # has a route to Postgres — the rest deliberately have no tailnet at all —
+    # so every rank calling this would fail on all but one. The payload is a
+    # setup document (polygons and config), small enough for a pickled bcast;
+    # the storm cube, which is not, has its own broadcast in tasks.py.
+    if _IS_ROOT:
+        row = (_proxied("get-instance", PUBLIC_ID)["row"] if _DB_PROXY_CONF
+               else db.get_instance_by_public_id(PUBLIC_ID))
+    else:
+        row = None
+    if _NUMPROCS > 1:
+        from mpi4py import MPI
+
+        row = MPI.COMM_WORLD.bcast(row, root=0)
+
     if row is None:
         msg = f"No instance {PUBLIC_ID} in the database"
         print(f"[hpc_run] {msg}", file=sys.stderr)
@@ -186,7 +235,12 @@ def main() -> int:
         print(f"[hpc_run] WARN could not spool result: {exc}", file=sys.stderr)
 
     try:
-        db.save_solution_bytes(PUBLIC_ID, gz_bytes)
+        if _DB_PROXY_CONF:
+            # Already spooled above; hand the proxy the file rather than piping
+            # hundreds of MB through an argv-sized channel.
+            _proxied("save-solution", PUBLIC_ID, spool)
+        else:
+            db.save_solution_bytes(PUBLIC_ID, gz_bytes)
     except Exception as exc:  # noqa: BLE001
         traceback.print_exc()
         publish("error", {"detail": f"Failed to store solution: {exc}. "

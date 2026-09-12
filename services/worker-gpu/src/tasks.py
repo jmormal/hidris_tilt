@@ -389,6 +389,27 @@ def _fetch_storm_cube(storm_ref, par):
     cache_dir = os.getenv("HPC_STORM_CACHE", "")
     cache = os.path.join(cache_dir, f"storm-{storm_ref}.npz") if cache_dir else ""
 
+    proxy_conf = os.getenv("HPC_DB_PROXY_CONF", "")
+
+    def _fetch_via_proxy():
+        """Multi-node: the solver is never proxied (LD_PRELOAD breaks MPI), so
+        the cube is fetched by a short-lived subprocess that writes it to the
+        cache path, and we then load it like any cache hit."""
+        import subprocess
+
+        target = cache or os.path.join(
+            os.getenv("HPC_WORKDIR", "/scratch"), f"storm-{storm_ref}.npz"
+        )
+        cmd = ["proxychains4", "-f", proxy_conf, "-q",
+               "python", "/app/src/db_proxy.py", "get-storm", storm_ref, target]
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+        if out.returncode != 0:
+            raise RuntimeError(
+                f"storm fetch via proxy failed: {(out.stderr or out.stdout)[-400:]}"
+            )
+        with np.load(target, allow_pickle=True) as z:
+            return z["cube"], z["meta"].item()
+
     def _load_local():
         if cache and os.path.exists(cache):
             try:
@@ -402,12 +423,16 @@ def _fetch_storm_cube(storm_ref, par):
     if not par["parallel"]:
         cube, meta = _load_local()
         if cube is None:
-            cube, meta = db.get_storm_cube(storm_ref)
-            if cube is not None and cache:
-                try:
-                    np.savez(cache, cube=cube, meta=np.array(meta, dtype=object))
-                except OSError as exc:
-                    print(f"[tasks:gpu] could not cache storm: {exc}")
+            if proxy_conf:
+                cube, meta = _fetch_via_proxy()
+            else:
+                cube, meta = db.get_storm_cube(storm_ref)
+                if cube is not None and cache:
+                    try:
+                        np.savez(cache, cube=cube,
+                                 meta=np.array(meta, dtype=object))
+                    except OSError as exc:
+                        print(f"[tasks:gpu] could not cache storm: {exc}")
         return cube, meta
 
     comm, myid = par["comm"], par["myid"]
@@ -415,12 +440,16 @@ def _fetch_storm_cube(storm_ref, par):
     if myid == 0:
         cube, meta = _load_local()
         if cube is None:
-            cube, meta = db.get_storm_cube(storm_ref)
-            if cube is not None and cache:
-                try:
-                    np.savez(cache, cube=cube, meta=np.array(meta, dtype=object))
-                except OSError as exc:
-                    print(f"[tasks:gpu] could not cache storm: {exc}")
+            if proxy_conf:
+                cube, meta = _fetch_via_proxy()
+            else:
+                cube, meta = db.get_storm_cube(storm_ref)
+                if cube is not None and cache:
+                    try:
+                        np.savez(cache, cube=cube,
+                                 meta=np.array(meta, dtype=object))
+                    except OSError as exc:
+                        print(f"[tasks:gpu] could not cache storm: {exc}")
 
     # Shape/dtype first so the others can preallocate; None means "not found",
     # and every rank must agree on that or they deadlock in the Bcast below.
@@ -592,7 +621,7 @@ def _finalize_result(
     vertices,
     src_epsg,
     dst_epsg,
-    depth_threshold=1e-5,
+    depth_threshold=0.01,
 ):
     """Derive all quantities vectorized, filter dry triangles, and pack the
     result as one binary blob (see _encode_result_binary). Nothing here ever
@@ -613,6 +642,12 @@ def _finalize_result(
     # sub-centimetre storm depths before the threshold could see them) is gone:
     # values go to the wire as float32, which resolves far below any depth a
     # solver produces.
+    # Cells that never hold more than this are dropped from the result. The old
+    # default was 1e-5 m — 0.01mm — which was fine for inlet-driven runs where
+    # most of the domain stays dry, and useless for storm-driven ones: rain
+    # falls everywhere, so essentially every cell passed. A 4.6M-triangle storm
+    # run kept 4,575,988 of them and produced a 1.8GB decoded buffer. 1cm is
+    # the smallest depth anyone would call a flood.
     wet = depth.max(axis=0) > depth_threshold  # (N,)
     wet_idx = np.flatnonzero(wet)
 
@@ -774,6 +809,10 @@ def _run_gpu_worker(args, payload=None):
     features = payload["features"]
     duration = config["duration"]
     yieldstep = config.get("output_timestep", args.yieldstep)
+    # Depth below which a cell is not worth storing. Per-instance so a fine
+    # study can lower it; the default keeps result size proportional to the
+    # flood rather than to the rainfall footprint.
+    min_depth = float(config.get("min_depth", os.getenv("ANUGA_MIN_DEPTH", "0.01")))
 
     # Only rank 0 clips the DEM (below), so this must exist on every rank or the
     # others NameError before they ever reach distribute().
@@ -1072,7 +1111,7 @@ def _run_gpu_worker(args, payload=None):
         vertices,
         src_epsg=src_epsg,
         dst_epsg=dst_epsg,
-        depth_threshold=1e-5,
+        depth_threshold=min_depth,
     )
 
     print("gziping")
