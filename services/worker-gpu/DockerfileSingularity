@@ -1,5 +1,29 @@
 # DockerfileSingularity — the SIF/HPC variant.
 #
+# ============================================================================
+# BEFORE YOU REBUILD: the running SIF is NOT what this file produces.
+#
+# As of 2026-09-12 the cluster runs anuga-gpu.sif with six bind-mounted
+# overrides from ~/containers/, because rebuilding costs ~40min plus a 16GB
+# upload and every one of these was a one-line fix:
+#
+#   anuga-zen3/extracted/anuga  -> the image's own ANUGA is built AVX-512 and
+#                                  cc86-only. It SIGILLs on the Zen 3 EPYCs and
+#                                  fails on the A30s. THE IMAGE COPY IS BROKEN.
+#   src-override/tasks.py          rank-0 build, storm broadcast + cache,
+#   src-override/hpc_run.py        MPI-aware ranks, MPI.Abort on failure,
+#   src-override/db.py             lazy pool,
+#   src-override/db_proxy.py       proxied tailnet ops (multi-node)
+#   hpc-entrypoint.sh              --reset, key redaction, mpirun-as-root
+#   netns-run-worker.sh            --reset
+#   mn-entrypoint.sh               the multi-node entrypoint
+#
+# A rebuild that does not fold these in will look like it works and then fail
+# exactly as it did before — silently, and in ways that took a day to diagnose.
+# Rebuild from the CURRENT repo sources, then delete the overrides from
+# run-simulation.slurm and run-simulation-mn.slurm together.
+# ============================================================================
+#
 # Kept separate from the plain `Dockerfile` used for the k8s cluster, because
 # three changes here exist ONLY to satisfy Singularity's runtime model and are
 # unnecessary (though harmless) under Kubernetes:
