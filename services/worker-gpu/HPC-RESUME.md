@@ -1,6 +1,6 @@
 # HPC worker: state of play
 
-Last verified 2026-09-10 against `vrhpcadm1.dsic.upv.es` (Slurm partition
+Last verified 2026-09-12 against `vrhpcadm1.dsic.upv.es` (Slurm partition
 `batch`, 6 × A40 nodes).
 
 ## Working
@@ -158,3 +158,47 @@ configured wins (`src/remote.py`).
 - The storm-cube concern in the notes still stands: `db.get_storm_cube()` pulls
   the whole 666MB raster to use a few km of it. Instances without a storm avoid
   it entirely — use one of those to test.
+
+## Multi-node (2026-09-12)
+
+`nodes>1` from the UI selects `run-simulation-mn.slurm`; `gpus` is then PER NODE
+and total ranks = nodes x gpus. Verified at 2 nodes x 2 GPUs; **never run on a
+large mesh** — see "Still to do".
+
+Only rank 0 gets a tailnet. The single-node trick of wrapping every rank in
+`unshare --net` is fatal here: a network namespace isolates MPI from the other
+machines. Rank 0 runs tailscaled userspace+SOCKS; the rest run bare.
+
+Three requirements, each of which first produced a misleading failure:
+
+- **No `--cleanenv`.** srun exports ~13 `PMIX_*` vars; they are how the
+  container's OpenMPI finds the PMIx server. Strip them and each task is its own
+  1-rank world (numprocs=1, no error, GPUs idle).
+- **Pin the MPI interface.** Every node has docker0 on `172.17.0.1/16` — the
+  same address — so OpenMPI blocks forever trying to reach itself. A 64MB bcast
+  went from hanging past a 5-minute limit to 0.07s (950 MB/s) once pinned.
+- **Never run the solver under proxychains.** LD_PRELOADing connect() breaks MPI
+  from inside (`MPI_ERR_INTERN` in `PyMPI_bcast`) even with localnet bypasses.
+  `src/db_proxy.py` runs the four tailnet operations as proxied subprocesses
+  instead; the MPI process itself is never proxied.
+
+Anything only rank 0 can reach must be broadcast: the instance payload, and the
+storm cube (845MB to 8 ranks across 4 nodes in 4.3s). `db.py`'s pool is lazy for
+the same reason — it used to be built at import, which fails on a rank with no
+route to Postgres.
+
+## Still to do
+
+- **Multi-node at scale.** The run worth doing: 4.6M triangles on 2 nodes x 4
+  GPUs against the 29:49 that 8 GPUs on one node achieved.
+- **`_finalize_result` and the mesh build are single-rank.** Neither gets faster
+  with more ranks, and both will dominate as rank counts grow.
+- **The SIF is stale.** ANUGA, tasks.py, hpc_run.py, db.py, db_proxy.py and both
+  entrypoints are bind-mounted from `~/containers/`. Fold them in at the next
+  rebuild; the image's own ANUGA is AVX-512 and cc86-only, i.e. broken here.
+- **The per-node `flock`** still serialises single-node sims on one node despite
+  8 GPUs; the second waits 30 min then exits 3.
+- **`min_depth`** is now configurable (default 0.01m) but has not been run since.
+- Cheap wins: `print(features)` dumps the setup once per rank; `clip_dem_to_asc`
+  writes a ~512MB ASCII grid that is then reparsed; the compute nodes have an
+  unused 8TB local `/scratch` while the workdir sits on NFS home.
