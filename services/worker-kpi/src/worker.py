@@ -64,4 +64,13 @@ if __name__ == "__main__":
     print(f"[{WORKER_NAME}] Starting, draining {WORKER_QUEUES} via {REDIS_URL}")
     queues = [Queue(name, connection=redis_conn) for name in WORKER_QUEUES]
     worker = SpotGracefulWorker(queues, connection=redis_conn, name=WORKER_NAME)
-    worker.work()
+    # burst: drain what is queued, then exit. Without it, work() blocks forever
+    # waiting for a job — and KEDA's ScaledJob is a run-once model, so a pod
+    # that arrives to an empty queue never returns. That happens routinely:
+    # pollingInterval is 15s and maxReplicaCount is 4, so KEDA can spawn several
+    # pods for one queue item, or spawn one just as another worker takes the
+    # last job. The loser then sits in work() until activeDeadlineSeconds (1500)
+    # SIGKILLs it — six such pods accumulated over 23h, each holding a slot for
+    # 25 minutes, with no logs and a DeadlineExceeded that says nothing about
+    # the cause.
+    worker.work(burst=True)

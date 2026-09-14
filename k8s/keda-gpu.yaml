@@ -23,6 +23,13 @@ spec:
         listLength: "1"
   jobTargetRef:
     backoffLimit: 3
+    # Kill a pod that outlives this. There was no deadline here at all, which
+    # matters more for GPU than CPU: a worker that arrives to an empty queue
+    # blocks in work() (see src/worker.py — now burst mode, but belt and
+    # braces) and would hold its nvidia.com/gpu claim indefinitely, with
+    # nothing to reclaim it. 4h matches the HPC job limit, so a genuine long
+    # solve is not cut short.
+    activeDeadlineSeconds: 14400
     template:
       spec:
         restartPolicy: Never
