@@ -20,6 +20,14 @@ summarized here — each also lists known dead ends and stale leftovers in the
 code. The root `README.md` is stale (describes an old three-service Node.js
 prototype) — ignore it.
 
+`.claude/skills/` holds four operational skills for the recurring workflows, each
+carrying the failure modes that cost real time to diagnose: `hpc-solve`
+(submit and follow a Slurm run), `hpc-triage` (a job failed, went quiet, or will
+not start), `hpc-image` (change what actually runs on the cluster — the SIF and
+the bind-mounted overrides that currently supersede it), and `hidris-stack` (the
+local k3d/Tilt/KEDA loop). Read the relevant one before touching that area;
+`docs/` explains how the system is built, the skills explain how it is operated.
+
 ## Repository layout
 
 This is a **superproject with git submodules**:

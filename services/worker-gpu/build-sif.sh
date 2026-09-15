@@ -8,7 +8,11 @@
 set -euo pipefail
 
 NVHPC_TAG="${NVHPC_TAG:-24.7-devel-cuda_multi-ubuntu22.04}"
-GPU_ARCH="${GPU_ARCH:-cc86,cc89}"
+# cc80 (A30) is NOT optional — vrhpc4 carries one and Slurm advertises a bare
+# "gpu:8", so a job cannot request a card type. A cc86-only binary imports fine
+# and then dies at the first kernel launch. Keep in step with
+# DockerfileSingularity's ARG GPU_ARCH.
+GPU_ARCH="${GPU_ARCH:-cc80,cc86,cc89}"
 IMAGE_TAG="anuga-gpu:latest"
 SIF_OUT="anuga-gpu.sif"
 
